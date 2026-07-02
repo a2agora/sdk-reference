@@ -65,14 +65,24 @@ class Buyer:
 
         Raises :class:`AcmpError` if the provider responds with ``acmp/error``.
         """
+        result = await self.request("acmp/invoke", task.to_params())
+        return Result.from_dict(result)
+
+    async def request(self, method: str, params: dict) -> dict:
+        """Send a JSON-RPC request and return its ``result`` payload.
+
+        Shared by :meth:`invoke` and other request/response methods built on
+        top of this connection (e.g. Layer 6 negotiation in
+        :class:`acmp.negotiation.Negotiator`). Raises :class:`AcmpError` if
+        the peer responds with a JSON-RPC error.
+        """
         req_id = new_request_id()
         future: asyncio.Future[dict] = asyncio.get_event_loop().create_future()
         self._pending[req_id] = future
 
-        request = make_request("acmp/invoke", task.to_params(), req_id)
-        await self._transport.send(request)
+        await self._transport.send(make_request(method, params, req_id))
 
         response = await future
         if "error" in response:
             raise AcmpError.from_jsonrpc(response["error"])
-        return Result.from_dict(response["result"])
+        return response["result"]

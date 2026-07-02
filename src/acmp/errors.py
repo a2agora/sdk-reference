@@ -46,7 +46,7 @@ class AcmpError(Exception):
 
     def __init__(
         self,
-        code: ErrorCode,
+        code: "ErrorCode | int",
         message: str | None = None,
         data: dict[str, Any] | None = None,
     ) -> None:
@@ -61,6 +61,15 @@ class AcmpError(Exception):
 
     @classmethod
     def from_jsonrpc(cls, err: dict[str, Any]) -> "AcmpError":
-        """Reconstruct an :class:`AcmpError` from a JSON-RPC ``error`` object."""
-        code = ErrorCode(err["code"])
+        """Reconstruct an :class:`AcmpError` from a JSON-RPC ``error`` object.
+
+        The code is kept as a plain ``int`` when it falls outside
+        :class:`ErrorCode` — e.g. a Layer 6 negotiation error, which isn't
+        part of the Layer 1 §3.3 table this enum models.
+        """
+        raw_code = err["code"]
+        try:
+            code: "ErrorCode | int" = ErrorCode(raw_code)
+        except ValueError:
+            code = raw_code
         return cls(code, err.get("message"), err.get("data"))

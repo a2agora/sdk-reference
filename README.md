@@ -15,9 +15,13 @@ Protocol) documents field-for-field.
   a provider and gets a result back, over an in-memory JSON-RPC transport.
 - **Stage 2 — Layer 6 negotiation.** A buyer requests an offer, accepts it
   (locking escrow), then invokes using the negotiated price and escrow id.
+- **Stage 3 — Layer 2 DAG.** A buyer-side orchestrator walks a task DAG,
+  resolving each task's input from upstream outputs and invoking independent
+  tasks concurrently.
 
-Planned next: Stage 3 (Layer 2 DAG — a buyer-side orchestrator running a
-multi-task pipeline).
+This completes the three planned reference stages. Further contributions
+(streaming, cancellation, additional transports) are welcome — see the notes
+below on what's intentionally out of scope so far.
 
 ## Install
 
@@ -31,14 +35,17 @@ pip install -e ".[dev]"
 ```bash
 python examples/01_minimal_invoke.py       # Layer 1 only
 python examples/02_negotiated_invoke.py    # Layer 6 -> Layer 1
+python examples/03_dag_pipeline.py         # Layer 2 DAG -> Layer 1 (concurrent)
 ```
 
-Both spin up a provider offering a `sentiment-analysis` capability — the
-same scenario as the worked example in
+The first two spin up a provider offering a `sentiment-analysis`
+capability — the same scenario as the worked example in
 [`spec/layers/02-task-format.md` §6.1](../spec/layers/02-task-format.md).
 The second demo additionally runs the offer/accept exchange from
 [`spec/layers/06-negotiation-protocol.md`](../spec/layers/06-negotiation-protocol.md)
-before invoking.
+before invoking. The third demo runs the split → parallel sentiment →
+aggregate pipeline from
+[`spec/layers/02-task-format.md` §6.2](../spec/layers/02-task-format.md).
 
 ## Run the tests
 
@@ -57,6 +64,7 @@ src/acmp/
   buyer.py        invoke() and the shared request() used by negotiation too
   negotiation.py  Layer 6 offer request/offer/accept dataclasses + Negotiator
   escrow_stub.py  Minimal in-memory stand-in for Layer 4 (not a real escrow)
+  dag.py          Layer 2 DAG/Edge/InputRef model + DagOrchestrator
 ```
 
 Every module docstring cites the spec section it implements.
@@ -82,9 +90,24 @@ Every module docstring cites the spec section it implements.
   of scope, still `discussion` status) — it only provides a real `escrow_id`
   for negotiation to hand to invoke, and lets a provider demonstrate the
   `escrow_invalid` (-33005) check from Layer 1 §3.3.
+- **DAG execution** (Layer 2 §3): `DagOrchestrator` treats the DAG purely as
+  a buyer-side plan — it is never sent over the wire. Providers only ever
+  see individual, literal `acmp/invoke` tasks; `InputRef`s (the `source`
+  form) are always resolved to a concrete `Payload` before invoking.
+  Independent tasks (no unresolved dependency) are invoked concurrently.
+- **Field path resolution** (Layer 2 §3 "Path grammar"): supports the
+  spec's small subset — member access (`data.foo`) and array indexing
+  (`data.items[0]`), rooted at the referenced task's whole `{type, data}`
+  output. Wildcards/slices are out of scope, per the spec.
+- **Failure policy** (Layer 2 §4): `DagOrchestrator` is **fail-fast** — the
+  first task failure cancels sibling tasks still in flight and re-raises.
+  Best-effort (continue independent branches) is a valid alternative per
+  the spec but not implemented here.
 - Streaming (`acmp/inputChunk`, `acmp/streamChunk`), heartbeats, and
-  cancellation are part of Layer 1 but not yet implemented in this SDK —
-  contributions welcome.
+  cancellation (`acmp/cancel`) are part of Layer 1 but not yet implemented
+  in this SDK — contributions welcome. As a consequence, `DagOrchestrator`'s
+  fail-fast behaviour cancels its own awaiting of in-flight sibling
+  invocations but doesn't yet notify their providers to stop processing.
 
 ## License
 

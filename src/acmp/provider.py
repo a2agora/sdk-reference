@@ -7,6 +7,7 @@ provider side of Layer 6 negotiation (``acmp/offerRequest``, ``acmp/accept``).
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from collections.abc import Awaitable, Callable
@@ -104,12 +105,24 @@ class Provider:
         )
 
     async def serve_forever(self) -> None:
-        """Read requests from the transport until it closes."""
+        """Read requests from the transport until it closes.
+
+        Each message is dispatched as its own concurrent task rather than
+        being awaited inline — otherwise a slow capability handler for one
+        request (e.g. one branch of a Layer 2 DAG) would block this provider
+        from even *reading* the next incoming request, let alone answering
+        it, serializing everything through a single provider.
+        """
+        in_flight: set[asyncio.Task] = set()
         try:
             while True:
                 message = await self._transport.receive()
-                await self._dispatch(message)
+                task = asyncio.create_task(self._dispatch(message))
+                in_flight.add(task)
+                task.add_done_callback(in_flight.discard)
         except TransportClosed:
+            if in_flight:
+                await asyncio.gather(*in_flight, return_exceptions=True)
             return
 
     async def _dispatch(self, message: dict) -> None:
@@ -227,6 +240,10 @@ class Provider:
         except AcmpError as err:
             await self._transport.send(make_error_response(req_id, err.to_jsonrpc()))
             return
+        except Exception as exc:  # noqa: BLE001 - see _handle_invoke for rationale
+            err = AcmpError(ErrorCode.INTERNAL, str(exc))
+            await self._transport.send(make_error_response(req_id, err.to_jsonrpc()))
+            return
 
         self._offers[offer.offer_id] = _OfferRecord(
             capability=offer.capability,
@@ -286,6 +303,10 @@ class Provider:
                     NegotiationErrorCode.OFFER_EXPIRED, data={"offer_id": offer_id}
                 )
         except AcmpError as err:
+            await self._transport.send(make_error_response(req_id, err.to_jsonrpc()))
+            return
+        except Exception as exc:  # noqa: BLE001 - see _handle_invoke for rationale
+            err = AcmpError(ErrorCode.INTERNAL, str(exc))
             await self._transport.send(make_error_response(req_id, err.to_jsonrpc()))
             return
 

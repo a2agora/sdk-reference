@@ -4,6 +4,15 @@ See https://github.com/a2agora/spec for the protocol specification.
 """
 
 from .buyer import Buyer
+from .dag import (
+    Dag,
+    DagOrchestrator,
+    DagResolutionError,
+    DagTaskSpec,
+    DagValidationError,
+    Edge,
+    InputRef,
+)
 from .errors import AcmpError, ErrorCode
 from .escrow_stub import EscrowStub
 from .messages import ACMP_VERSION, Payload, Result, Task
@@ -22,9 +31,16 @@ __all__ = [
     "AcceptedOffer",
     "AcmpError",
     "Buyer",
+    "Dag",
+    "DagOrchestrator",
+    "DagResolutionError",
+    "DagTaskSpec",
+    "DagValidationError",
+    "Edge",
     "ErrorCode",
     "EscrowStub",
     "InMemoryTransport",
+    "InputRef",
     "NegotiationErrorCode",
     "Negotiator",
     "Offer",

@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/
+dist/
+build/
+
+# Working notes for the current multi-stage build — not part of the
+# published SDK, deleted once all stages are complete.
+design.md
+tasks.md

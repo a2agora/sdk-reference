@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .buyer import Buyer
-from .messages import Payload, Result, Task
+from .messages import Payload, Result, Task, put_if_set
 
 _PATH_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\[\d+\]")
 
@@ -102,10 +102,7 @@ class DagTaskSpec:
             "input": self.input.to_dict(),
             "output_type": self.output_type,
         }
-        for key in ("input_tokens_est", "max_price_cu", "preferred_tier", "proof_method", "metadata"):
-            value = getattr(self, key)
-            if value is not None:
-                d[key] = value
+        put_if_set(d, self, "input_tokens_est", "max_price_cu", "preferred_tier", "proof_method", "metadata")
         return d
 
     @classmethod
@@ -257,7 +254,8 @@ def resolve_input(spec_input: Payload | InputRef, completed: dict[str, Result], 
         outputs = [completed[t].output.to_dict() for t in spec_input.from_tasks]
         return Payload(type="json", data=outputs)
 
-    upstream = completed[spec_input.from_task]  # type: ignore[index]
+    assert spec_input.from_task is not None  # guaranteed by InputRef.__post_init__
+    upstream = completed[spec_input.from_task]
     output_dict = upstream.output.to_dict()
     if spec_input.field is None:
         return Payload(type=output_dict["type"], data=output_dict["data"])

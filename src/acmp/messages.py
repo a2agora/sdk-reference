@@ -24,6 +24,20 @@ def new_request_id() -> str:
     return f"req_{secrets.token_hex(4)}"
 
 
+def put_if_set(d: dict[str, Any], obj: Any, *names: str) -> None:
+    """Copy each named attribute from ``obj`` into ``d``, skipping ``None`` values.
+
+    Shared by the several dataclasses in this SDK (:class:`Task`,
+    :class:`~acmp.negotiation.OfferRequest`,
+    :class:`~acmp.dag.DagTaskSpec`) that serialize a set of optional fields
+    the same way: include it only if the buyer actually set it.
+    """
+    for name in names:
+        value = getattr(obj, name)
+        if value is not None:
+            d[name] = value
+
+
 @dataclass
 class Payload:
     """A typed payload: ``{type, data}`` (Layer 2 §1).
@@ -71,18 +85,16 @@ class Task:
             "stream": self.stream,
             "input_stream": self.input_stream,
         }
-        # Only include optionals that are set, to keep the wire form clean.
-        for key in (
+        put_if_set(
+            params,
+            self,
             "input_tokens_est",
             "max_price_cu",
             "preferred_tier",
             "escrow_id",
             "proof_method",
             "metadata",
-        ):
-            value = getattr(self, key)
-            if value is not None:
-                params[key] = value
+        )
         return params
 
     @classmethod

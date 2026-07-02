@@ -149,6 +149,15 @@ class Provider:
 
         await handler(message)
 
+    async def _reply_error(self, req_id: str, err: AcmpError) -> None:
+        """Send ``err`` as a JSON-RPC error response for ``req_id``.
+
+        Pulled out because every handler below needs to do this identically
+        both for expected :class:`AcmpError`\\ s and for unexpected bugs
+        (wrapped as ``ErrorCode.INTERNAL``).
+        """
+        await self._transport.send(make_error_response(req_id, err.to_jsonrpc()))
+
     # -- acmp/invoke --------------------------------------------------------
 
     async def _handle_invoke(self, message: dict) -> None:
@@ -172,12 +181,12 @@ class Provider:
             content = await self._execute(task)
         except AcmpError as err:
             self._result_cache[task_id] = {"error": err.to_jsonrpc()}
-            await self._transport.send(make_error_response(req_id, err.to_jsonrpc()))
+            await self._reply_error(req_id, err)
             return
         except Exception as exc:  # noqa: BLE001 - convert any bug into -33099
             err = AcmpError(ErrorCode.INTERNAL, str(exc))
             self._result_cache[task_id] = {"error": err.to_jsonrpc()}
-            await self._transport.send(make_error_response(req_id, err.to_jsonrpc()))
+            await self._reply_error(req_id, err)
             return
 
         self._result_cache[task_id] = {"result": content}
@@ -238,11 +247,10 @@ class Provider:
         try:
             offer = self._build_offer(OfferRequest.from_params(message["params"]))
         except AcmpError as err:
-            await self._transport.send(make_error_response(req_id, err.to_jsonrpc()))
+            await self._reply_error(req_id, err)
             return
         except Exception as exc:  # noqa: BLE001 - see _handle_invoke for rationale
-            err = AcmpError(ErrorCode.INTERNAL, str(exc))
-            await self._transport.send(make_error_response(req_id, err.to_jsonrpc()))
+            await self._reply_error(req_id, AcmpError(ErrorCode.INTERNAL, str(exc)))
             return
 
         self._offers[offer.offer_id] = _OfferRecord(
@@ -303,11 +311,10 @@ class Provider:
                     NegotiationErrorCode.OFFER_EXPIRED, data={"offer_id": offer_id}
                 )
         except AcmpError as err:
-            await self._transport.send(make_error_response(req_id, err.to_jsonrpc()))
+            await self._reply_error(req_id, err)
             return
         except Exception as exc:  # noqa: BLE001 - see _handle_invoke for rationale
-            err = AcmpError(ErrorCode.INTERNAL, str(exc))
-            await self._transport.send(make_error_response(req_id, err.to_jsonrpc()))
+            await self._reply_error(req_id, AcmpError(ErrorCode.INTERNAL, str(exc)))
             return
 
         record.accepted = True

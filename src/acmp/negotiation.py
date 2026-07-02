@@ -31,6 +31,7 @@ from enum import IntEnum
 from typing import Any
 
 from .buyer import Buyer
+from .messages import put_if_set
 
 DEFAULT_OFFER_VALID_MS = 5000
 
@@ -67,16 +68,15 @@ class OfferRequest:
 
     def to_params(self) -> dict[str, Any]:
         params: dict[str, Any] = {"capability": self.capability}
-        for key in (
+        put_if_set(
+            params,
+            self,
             "max_price_cu",
             "max_latency_ms",
             "proof_method",
             "input_tokens_est",
             "offer_valid_ms",
-        ):
-            value = getattr(self, key)
-            if value is not None:
-                params[key] = value
+        )
         return params
 
     @classmethod

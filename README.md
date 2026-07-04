@@ -1,8 +1,8 @@
 # ACMP Reference SDK
 
 A dependency-light Python reference implementation of the **Agent Compute
-Market Protocol (ACMP)**, the economic layer defined by
-[A2Agora](https://github.com/a2agora/spec).
+Market Protocol (ACMP)**, the economic layer defined by A2Agora
+([GitHub](https://github.com/a2agora/spec) · [Codeberg](https://codeberg.org/a2agora/spec)).
 
 This SDK exists to prove the protocol is implementable, not to be a
 production-grade agent framework. It follows the spec's Layer 1 (Transport &
@@ -40,12 +40,14 @@ python examples/03_dag_pipeline.py         # Layer 2 DAG -> Layer 1 (concurrent)
 
 The first two spin up a provider offering a `sentiment-analysis`
 capability — the same scenario as the worked example in
-[`spec/layers/02-task-format.md` §6.1](../spec/layers/02-task-format.md).
+`spec/layers/02-task-format.md` §6.1
+([GitHub](https://github.com/a2agora/spec/blob/main/layers/02-task-format.md) · [Codeberg](https://codeberg.org/a2agora/spec/src/branch/main/layers/02-task-format.md)).
 The second demo additionally runs the offer/accept exchange from
-[`spec/layers/06-negotiation-protocol.md`](../spec/layers/06-negotiation-protocol.md)
+`spec/layers/06-negotiation-protocol.md`
+([GitHub](https://github.com/a2agora/spec/blob/main/layers/06-negotiation-protocol.md) · [Codeberg](https://codeberg.org/a2agora/spec/src/branch/main/layers/06-negotiation-protocol.md))
 before invoking. The third demo runs the split → parallel sentiment →
-aggregate pipeline from
-[`spec/layers/02-task-format.md` §6.2](../spec/layers/02-task-format.md).
+aggregate pipeline from `spec/layers/02-task-format.md` §6.2
+([GitHub](https://github.com/a2agora/spec/blob/main/layers/02-task-format.md) · [Codeberg](https://codeberg.org/a2agora/spec/src/branch/main/layers/02-task-format.md)).
 
 ## Run the tests
 
@@ -111,4 +113,4 @@ Every module docstring cites the spec section it implements.
 
 ## License
 
-Apache 2.0, matching the [A2Agora spec](../spec/LICENSE).
+Apache 2.0, matching the A2Agora spec ([GitHub](https://github.com/a2agora/spec/blob/main/LICENSE) · [Codeberg](https://codeberg.org/a2agora/spec/src/branch/main/LICENSE)).

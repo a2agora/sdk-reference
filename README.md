@@ -10,6 +10,8 @@ A dependency-light Python reference implementation of the **Agent Compute
 Market Protocol (ACMP)**, the economic layer defined by A2Agora
 ([GitHub](https://github.com/a2agora/spec) · [Codeberg](https://codeberg.org/a2agora/spec)).
 
+**Rendered docs → [a2agora.org/sdk-reference](https://a2agora.org/sdk-reference)** · Project home → [a2agora.org](https://a2agora.org)
+
 This SDK exists to prove the protocol is implementable, not to be a
 production-grade agent framework. It follows the spec's Layer 1 (Transport &
 Invocation), Layer 2 (Task Decomposition Format), and Layer 6 (Negotiation

@@ -10,3 +10,9 @@ build/
 # published SDK, deleted once all stages are complete.
 design.md
 tasks.md
+
+# Jekyll
+_site/
+.jekyll-cache/
+.jekyll-metadata
+Gemfile.lock

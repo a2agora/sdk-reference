@@ -1,0 +1,32 @@
+title: ACMP Reference SDK
+description: >-
+  Python reference implementation of the Agent Compute Market Protocol (ACMP) —
+  buyer/provider transactions, negotiation, and DAG orchestration (Layers 1, 2, 6).
+url: https://a2agora.org
+baseurl: "/sdk-reference"
+
+remote_theme: just-the-docs/just-the-docs
+
+plugins:
+  - jekyll-seo-tag
+  - jekyll-sitemap
+
+search_enabled: true
+color_scheme: light
+
+aux_links:
+  "a2agora.org":
+    - "https://a2agora.org"
+  "Spec":
+    - "https://github.com/a2agora/spec"
+aux_links_new_tab: true
+
+exclude:
+  - src/
+  - tests/
+  - examples/
+  - pyproject.toml
+  - Gemfile
+  - Gemfile.lock
+  - vendor/
+  - .venv/

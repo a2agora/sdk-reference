@@ -270,10 +270,9 @@ class DagOrchestrator:
     Independent tasks (no unresolved dependencies) are invoked concurrently.
     Failure policy is **fail-fast** (Layer 2 §4): the first task failure
     stops scheduling of anything not already in flight, cancels sibling
-    tasks still awaiting their ``acmp/invoke`` response, and re-raises the
-    original error. This SDK doesn't yet implement ``acmp/cancel``
-    (see README), so in-flight *providers* aren't notified to stop — only
-    this orchestrator's own awaiting is cancelled.
+    tasks still awaiting their ``acmp/invoke`` response, sends
+    ``acmp/cancel`` for each of them so their providers stop working too
+    (Layer 1 §3.7), and re-raises the original error.
     """
 
     def __init__(self, buyer: Buyer) -> None:
@@ -338,9 +337,17 @@ class DagOrchestrator:
                 if failure is not None:
                     raise failure
         finally:
-            for handle in in_flight:
-                handle.cancel()
             if in_flight:
+                abandoned = list(in_flight.values())
+                for handle in in_flight:
+                    handle.cancel()
                 await asyncio.gather(*in_flight.keys(), return_exceptions=True)
+                # Tell the providers to stop working on the abandoned tasks
+                # (best-effort: the transport may already be closing).
+                for tid in abandoned:
+                    try:
+                        await self._buyer.cancel(tid, reason="dag fail-fast")
+                    except Exception:  # noqa: BLE001
+                        pass
 
         return completed

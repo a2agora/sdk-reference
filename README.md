@@ -26,10 +26,14 @@ Protocol) documents field-for-field.
 - **Stage 3 — Layer 2 DAG.** A buyer-side orchestrator walks a task DAG,
   resolving each task's input from upstream outputs and invoking independent
   tasks concurrently.
+- **Stage 4 — Layer 1 streaming, heartbeats & cancellation.** Output
+  streaming (`acmp/streamChunk`), input streaming (`acmp/inputChunk`),
+  automatic + manual heartbeats (`acmp/heartbeat`), cooperative cancellation
+  (`acmp/cancel`), buyer-side `timeout_ms` enforcement, and -33007 feature
+  gating.
 
-This completes the three planned reference stages. Further contributions
-(streaming, cancellation, additional transports) are welcome — see the notes
-below on what's intentionally out of scope so far.
+Further contributions (additional transports, streaming DAG edges) are
+welcome — see the notes below on what's intentionally out of scope so far.
 
 ## Install
 
@@ -44,6 +48,7 @@ pip install -e ".[dev]"
 python examples/01_minimal_invoke.py       # Layer 1 only
 python examples/02_negotiated_invoke.py    # Layer 6 -> Layer 1
 python examples/03_dag_pipeline.py         # Layer 2 DAG -> Layer 1 (concurrent)
+python examples/04_streaming_cancel.py     # streaming + heartbeats + cancel
 ```
 
 The first two spin up a provider offering a `sentiment-analysis`
@@ -70,8 +75,8 @@ src/acmp/
   errors.py       ACMP error codes (-33xxx) and the AcmpError exception
   messages.py     Task/Payload/Result dataclasses + JSON-RPC framing helpers
   transport.py    Transport ABC + InMemoryTransport (paired in-process channel)
-  provider.py     Capability registry, invoke + negotiation dispatch, pricing, proof
-  buyer.py        invoke() and the shared request() used by negotiation too
+  provider.py     Capability registry, invoke/streaming/cancel dispatch, TaskContext
+  buyer.py        invoke() with chunk/heartbeat callbacks, timeout, cancel, input chunks
   negotiation.py  Layer 6 offer request/offer/accept dataclasses + Negotiator
   escrow_stub.py  Minimal in-memory stand-in for Layer 4 (not a real escrow)
   dag.py          Layer 2 DAG/Edge/InputRef model + DagOrchestrator
@@ -110,14 +115,22 @@ Every module docstring cites the spec section it implements.
   (`data.items[0]`), rooted at the referenced task's whole `{type, data}`
   output. Wildcards/slices are out of scope, per the spec.
 - **Failure policy** (Layer 2 §4): `DagOrchestrator` is **fail-fast** — the
-  first task failure cancels sibling tasks still in flight and re-raises.
+  first task failure cancels sibling tasks still in flight, sends
+  `acmp/cancel` so their providers stop working too, and re-raises.
   Best-effort (continue independent branches) is a valid alternative per
   the spec but not implemented here.
-- Streaming (`acmp/inputChunk`, `acmp/streamChunk`), heartbeats, and
-  cancellation (`acmp/cancel`) are part of Layer 1 but not yet implemented
-  in this SDK — contributions welcome. As a consequence, `DagOrchestrator`'s
-  fail-fast behaviour cancels its own awaiting of in-flight sibling
-  invocations but doesn't yet notify their providers to stop processing.
+- **Streaming & liveness** (Layer 1 §3.4–§3.7, §7): output and input
+  streaming, heartbeats (automatic keep-alives at the provider's
+  `heartbeat_interval_ms` plus manual progress via `ctx.heartbeat`), and
+  cooperative cancellation are implemented. Capability handlers opt in by
+  declaring a second parameter (`handler(task, ctx)` receives a
+  `TaskContext`); single-parameter handlers keep working unchanged.
+  `task.timeout_ms` is enforced buyer-side as the hard deadline (Layer 1
+  §3.1), with `acmp/cancel` sent on expiry. Feature gating uses -33007;
+  since the in-memory transport has no MCP `initialize` handshake, the
+  advertisement check is enforced provider-side only. Proof over *streamed*
+  output is not implemented (-33006). `stream_eligible` DAG edges (Layer 2
+  §5) remain out of scope.
 
 ## License
 

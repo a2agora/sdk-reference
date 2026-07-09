@@ -23,7 +23,7 @@ from .negotiation import (
     Offer,
     OfferRequest,
 )
-from .provider import Provider
+from .provider import Provider, TaskContext
 from .transport import InMemoryTransport, Transport, TransportClosed
 
 __all__ = [
@@ -49,6 +49,7 @@ __all__ = [
     "Provider",
     "Result",
     "Task",
+    "TaskContext",
     "Transport",
     "TransportClosed",
 ]

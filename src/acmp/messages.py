@@ -58,10 +58,14 @@ class Payload:
 
 @dataclass
 class Task:
-    """A single unit of work carried by ``acmp/invoke`` (Layer 2 §1)."""
+    """A single unit of work carried by ``acmp/invoke`` (Layer 2 §1).
+
+    ``input`` MAY be ``None`` when ``input_stream`` is ``True`` — the input
+    then arrives incrementally via ``acmp/inputChunk`` (Layer 1 §3.4).
+    """
 
     capability: str
-    input: Payload
+    input: Payload | None = None
     task_id: str = field(default_factory=new_task_id)
     output_type: str = "json"
     input_tokens_est: int | None = None
@@ -79,12 +83,13 @@ class Task:
         params: dict[str, Any] = {
             "task_id": self.task_id,
             "capability": self.capability,
-            "input": self.input.to_dict(),
             "output_type": self.output_type,
             "timeout_ms": self.timeout_ms,
             "stream": self.stream,
             "input_stream": self.input_stream,
         }
+        if self.input is not None:
+            params["input"] = self.input.to_dict()
         put_if_set(
             params,
             self,
@@ -99,10 +104,11 @@ class Task:
 
     @classmethod
     def from_params(cls, params: dict[str, Any]) -> "Task":
+        raw_input = params.get("input")
         return cls(
             task_id=params["task_id"],
             capability=params["capability"],
-            input=Payload.from_dict(params["input"]),
+            input=Payload.from_dict(raw_input) if raw_input is not None else None,
             output_type=params.get("output_type", "json"),
             input_tokens_est=params.get("input_tokens_est"),
             max_price_cu=params.get("max_price_cu"),

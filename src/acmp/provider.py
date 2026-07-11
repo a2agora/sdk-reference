@@ -515,6 +515,14 @@ class Provider:
                 },
             )
 
+        # Layer 6 §2.1: a provider MUST reject a quote for a proof method it
+        # cannot deliver (-33006) rather than promise it and fail at invoke.
+        if offer_request.proof_method not in (None, "result-hash"):
+            raise AcmpError(
+                ErrorCode.PROOF_UNSUPPORTED,
+                data={"proof_method": offer_request.proof_method},
+            )
+
         valid_ms = offer_request.offer_valid_ms or DEFAULT_OFFER_VALID_MS
         return Offer(
             offer_id=new_offer_id(),

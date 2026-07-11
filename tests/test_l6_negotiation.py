@@ -127,6 +127,24 @@ async def test_accept_unknown_offer_id_raises():
 
 
 @pytest.mark.asyncio
+async def test_offer_request_with_unsupported_proof_raises():
+    """Layer 6 §2.1: quoting an undeliverable proof method MUST fail (-33006)."""
+    buyer_t, provider_t, provider, _escrow = make_pair()
+    serve_task = asyncio.create_task(provider.serve_forever())
+
+    async with Buyer(buyer_t) as buyer:
+        negotiator = Negotiator(buyer)
+        with pytest.raises(AcmpError) as exc_info:
+            await negotiator.request_offer(
+                OfferRequest(capability="echo", proof_method="execution-trace")
+            )
+
+    assert exc_info.value.code == ErrorCode.PROOF_UNSUPPORTED
+
+    await serve_task
+
+
+@pytest.mark.asyncio
 async def test_accept_without_escrow_is_direct_mode():
     buyer_t, provider_t, provider, _escrow = make_pair()
     serve_task = asyncio.create_task(provider.serve_forever())

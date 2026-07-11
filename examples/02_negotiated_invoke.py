@@ -67,8 +67,11 @@ async def main() -> None:
         print(f"latency_sla_ms: {offer.latency_sla_ms}")
         print(f"valid_until_ms: {offer.valid_until_ms:.0f}")
 
-        print("\n--- accept ---")
-        accepted = await negotiator.accept(offer)
+        print("\n--- lock escrow (Layer 4), then accept ---")
+        # Per the Layer 6 draft, the BUYER locks the funds and supplies the
+        # escrow_id at accept; the ack echoes it.
+        escrow_id = escrow.lock(offer.price_cu)
+        accepted = await negotiator.accept(offer, escrow_id=escrow_id)
         print(f"escrow_id:      {accepted.escrow_id}")
         print(f"price_cu:       {accepted.price_cu}")
 

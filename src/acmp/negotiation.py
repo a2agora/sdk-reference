@@ -15,11 +15,13 @@ carries only the requirement fields from that RFQ (capability, budget,
 latency SLA, proof requirement) — the fields relevant to the
 "BUYER -> PROVIDER: offer request" step of the flow above.
 
-Layer 6 is still `discussion` status in the spec and does not yet define
-formal JSON-RPC method or error code names. This module picks concrete
-ones (the ``acmp/offerRequest`` / ``acmp/accept`` methods, and the
--34xxx error range) as an SDK-level extension — kept clearly separate
-from the Layer 1 §3.3 error codes in :mod:`acmp.errors`.
+The Layer 6 draft formalized this flow after the SDK proved it: the
+``acmp/offerRequest`` / ``acmp/accept`` methods and the -34xxx error codes
+below are wire-compatible with the spec (the spec adopted the SDK's de-facto
+numbers). Per the spec, the *buyer* locks escrow (Layer 4) and supplies the
+``escrow_id`` at accept; the ack echoes it. Offers MAY carry the negotiated
+``challenge_window_ms`` term and SHOULD carry a Layer 7 ``sig`` envelope —
+this SDK transports both fields but does not sign (no key infrastructure).
 """
 
 from __future__ import annotations
@@ -60,8 +62,11 @@ class OfferRequest:
     capability: str
     max_price_cu: float | None = None
     max_latency_ms: int | None = None
+    preferred_tier: str | None = None
     proof_method: str | None = None
     input_tokens_est: int | None = None
+    challenge_window_ms: int | None = None
+    """Proposed claim challenge window (Layer 4 §4.5), negotiated as a term."""
     offer_valid_ms: int | None = None
     """Buyer's requested offer validity window; the provider may honour it,
     clamp it, or fall back to :data:`DEFAULT_OFFER_VALID_MS`."""
@@ -73,8 +78,10 @@ class OfferRequest:
             self,
             "max_price_cu",
             "max_latency_ms",
+            "preferred_tier",
             "proof_method",
             "input_tokens_est",
+            "challenge_window_ms",
             "offer_valid_ms",
         )
         return params
@@ -85,8 +92,10 @@ class OfferRequest:
             capability=params["capability"],
             max_price_cu=params.get("max_price_cu"),
             max_latency_ms=params.get("max_latency_ms"),
+            preferred_tier=params.get("preferred_tier"),
             proof_method=params.get("proof_method"),
             input_tokens_est=params.get("input_tokens_est"),
+            challenge_window_ms=params.get("challenge_window_ms"),
             offer_valid_ms=params.get("offer_valid_ms"),
         )
 
@@ -101,6 +110,11 @@ class Offer:
     valid_until_ms: float
     latency_sla_ms: int | None = None
     proof_method: str | None = None
+    challenge_window_ms: int | None = None
+    """Confirmed challenge-window term; the buyer carries it to Layer 4 bind."""
+    sig: dict[str, Any] | None = None
+    """Layer 7 signature envelope over the offer (SHOULD per spec). This SDK
+    transports the field but does not produce signatures itself."""
 
     def is_expired(self, at_ms: float | None = None) -> bool:
         return (at_ms if at_ms is not None else now_ms()) > self.valid_until_ms
@@ -112,10 +126,7 @@ class Offer:
             "price_cu": self.price_cu,
             "valid_until_ms": self.valid_until_ms,
         }
-        if self.latency_sla_ms is not None:
-            d["latency_sla_ms"] = self.latency_sla_ms
-        if self.proof_method is not None:
-            d["proof_method"] = self.proof_method
+        put_if_set(d, self, "latency_sla_ms", "proof_method", "challenge_window_ms", "sig")
         return d
 
     @classmethod
@@ -127,20 +138,28 @@ class Offer:
             valid_until_ms=d["valid_until_ms"],
             latency_sla_ms=d.get("latency_sla_ms"),
             proof_method=d.get("proof_method"),
+            challenge_window_ms=d.get("challenge_window_ms"),
+            sig=d.get("sig"),
         )
 
 
 @dataclass
 class AcceptedOffer:
-    """The "PROVIDER -> BUYER: ack (task begins)" step (Layer 6)."""
+    """The "PROVIDER -> BUYER: ack" step (Layer 6 §2.2).
+
+    ``escrow_id`` echoes what the buyer supplied at accept; ``None`` means
+    escrow-less direct settlement (Layer 1, "Relationship to Negotiation").
+    """
 
     offer_id: str
-    escrow_id: str
     price_cu: float
+    escrow_id: str | None = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "AcceptedOffer":
-        return cls(offer_id=d["offer_id"], escrow_id=d["escrow_id"], price_cu=d["price_cu"])
+        return cls(
+            offer_id=d["offer_id"], price_cu=d["price_cu"], escrow_id=d.get("escrow_id")
+        )
 
 
 class Negotiator:
@@ -160,12 +179,19 @@ class Negotiator:
         result = await self._buyer.request("acmp/offerRequest", offer_request.to_params())
         return Offer.from_dict(result)
 
-    async def accept(self, offer: Offer) -> AcceptedOffer:
+    async def accept(self, offer: Offer, *, escrow_id: str | None = None) -> AcceptedOffer:
         """Send ``acmp/accept`` for a still-valid offer and return the ack.
+
+        Per the Layer 6 draft (§2.2), the **buyer** locks the escrow (Layer 4)
+        beforehand and passes its ``escrow_id`` here; omitting it signals
+        escrow-less direct settlement.
 
         Raises :class:`acmp.errors.AcmpError` with a :class:`NegotiationErrorCode`
         if the offer has expired, is unknown to the provider, or was already
         accepted.
         """
-        result = await self._buyer.request("acmp/accept", {"offer_id": offer.offer_id})
+        params: dict[str, Any] = {"offer_id": offer.offer_id}
+        if escrow_id is not None:
+            params["escrow_id"] = escrow_id
+        result = await self._buyer.request("acmp/accept", params)
         return AcceptedOffer.from_dict(result)

@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import Any, Union
 
 from .errors import AcmpError, ErrorCode
-from .escrow_stub import EscrowStub, new_escrow_id
+from .escrow_stub import EscrowStub
 from .messages import (
     Payload,
     Result,
@@ -523,6 +523,9 @@ class Provider:
             valid_until_ms=now_ms() + valid_ms,
             latency_sla_ms=cap.latency_sla_ms,
             proof_method=offer_request.proof_method,
+            # Confirm the buyer's proposed challenge window unchanged; a real
+            # provider MAY adjust it here (Layer 6 §2.1).
+            challenge_window_ms=offer_request.challenge_window_ms,
         )
 
     async def _handle_accept(self, message: dict) -> None:
@@ -551,8 +554,11 @@ class Provider:
             return
 
         record.accepted = True
-        escrow_id = (
-            self._escrow.lock(record.price_cu) if self._escrow is not None else new_escrow_id()
-        )
-        ack = {"offer_id": offer_id, "escrow_id": escrow_id, "price_cu": record.price_cu}
+        # Layer 6 §2.2: the *buyer* locked the escrow (Layer 4) and supplies
+        # its id at accept; the ack merely echoes it. Absence signals
+        # escrow-less direct settlement.
+        escrow_id = message["params"].get("escrow_id")
+        ack: dict = {"offer_id": offer_id, "price_cu": record.price_cu}
+        if escrow_id is not None:
+            ack["escrow_id"] = escrow_id
         await self._transport.send(make_result_response(req_id, ack))

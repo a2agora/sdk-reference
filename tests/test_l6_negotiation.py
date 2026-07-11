@@ -39,22 +39,30 @@ def make_pair(price_cu: float = 0.003, latency_sla_ms: int | None = 800):
 
 @pytest.mark.asyncio
 async def test_full_negotiation_then_invoke():
-    buyer_t, provider_t, provider, _escrow = make_pair(price_cu=0.003)
+    buyer_t, provider_t, provider, escrow = make_pair(price_cu=0.003)
     serve_task = asyncio.create_task(provider.serve_forever())
 
     async with Buyer(buyer_t) as buyer:
         negotiator = Negotiator(buyer)
 
         offer = await negotiator.request_offer(
-            OfferRequest(capability="echo", max_price_cu=0.005, proof_method="result-hash")
+            OfferRequest(
+                capability="echo",
+                max_price_cu=0.005,
+                proof_method="result-hash",
+                challenge_window_ms=86400000,
+            )
         )
         assert offer.price_cu == 0.003
         assert offer.latency_sla_ms == 800
+        assert offer.challenge_window_ms == 86400000  # term echoed (Layer 6 §2.1)
         assert not offer.is_expired()
 
-        accepted = await negotiator.accept(offer)
+        # Layer 6 §2.2: the buyer locks (Layer 4) and supplies the escrow_id.
+        escrow_id = escrow.lock(offer.price_cu)
+        accepted = await negotiator.accept(offer, escrow_id=escrow_id)
         assert accepted.price_cu == 0.003
-        assert accepted.escrow_id
+        assert accepted.escrow_id == escrow_id
 
         task = Task(
             capability="echo",
@@ -114,6 +122,21 @@ async def test_accept_unknown_offer_id_raises():
             await buyer.request("acmp/accept", {"offer_id": "offer_does_not_exist"})
 
     assert exc_info.value.code == NegotiationErrorCode.OFFER_NOT_FOUND
+
+    await serve_task
+
+
+@pytest.mark.asyncio
+async def test_accept_without_escrow_is_direct_mode():
+    buyer_t, provider_t, provider, _escrow = make_pair()
+    serve_task = asyncio.create_task(provider.serve_forever())
+
+    async with Buyer(buyer_t) as buyer:
+        negotiator = Negotiator(buyer)
+        offer = await negotiator.request_offer(OfferRequest(capability="echo"))
+        accepted = await negotiator.accept(offer)  # no escrow_id
+
+    assert accepted.escrow_id is None  # direct settlement (Layer 1 §Relationship)
 
     await serve_task
 

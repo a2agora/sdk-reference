@@ -94,17 +94,19 @@ Every module docstring cites the spec section it implements.
 - **Pricing**: each registered capability has a `price_cu`; the provider
   rejects with `budget_exceeded` (-33001) if `price_cu > task.max_price_cu`
   (checked both at negotiation time and at invoke time).
-- **Negotiation** (Layer 6): `Negotiator.request_offer()` /
-  `.accept()` implement the offer-request → offer → accept → ack flow. Layer
-  6 is still `discussion` status in the spec and doesn't define formal
-  method or error-code names, so this SDK picks concrete ones
-  (`acmp/offerRequest`, `acmp/accept`, and a `NegotiationErrorCode` range at
-  -34xxx, kept separate from the Layer 1 §3.3 codes) as a documented
-  extension.
-- **Escrow**: `EscrowStub` is *not* a Layer 4 implementation (Layer 4 is out
-  of scope, still `discussion` status) — it only provides a real `escrow_id`
-  for negotiation to hand to invoke, and lets a provider demonstrate the
-  `escrow_invalid` (-33005) check from Layer 1 §3.3.
+- **Negotiation** (Layer 6, now `draft`): `Negotiator.request_offer()` /
+  `.accept()` implement the offer-request → offer → accept → ack flow. The
+  spec formalized this after the SDK proved it, adopting the SDK's method
+  names and -34xxx error codes wire-compatibly. Per the draft, the *buyer*
+  locks escrow and supplies `escrow_id` at accept (the ack echoes it;
+  omitting it means direct settlement), and offers carry the negotiated
+  `challenge_window_ms` term. The offer `sig` envelope (Layer 7) is
+  transported but not produced — this SDK has no key infrastructure.
+- **Escrow**: `EscrowStub` is *not* a Layer 4 implementation — it only
+  provides a real `escrow_id` for negotiation to hand to invoke, and lets a
+  provider demonstrate the `escrow_invalid` (-33005) check. The full Layer 4
+  draft (escrow agent role, claim/dispute, settlement rails) is unimplemented
+  here and listed as a contribution entry point.
 - **DAG execution** (Layer 2 §3): `DagOrchestrator` treats the DAG purely as
   a buyer-side plan — it is never sent over the wire. Providers only ever
   see individual, literal `acmp/invoke` tasks; `InputRef`s (the `source`

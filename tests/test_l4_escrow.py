@@ -697,3 +697,270 @@ async def test_reclaim_retry_with_same_op_ref_replays_result():
     assert first == second
     assert agent.ledger.balance(BUYER_ID) == pytest.approx(1.0)  # refunded once, not twice
     await asyncio.gather(*serve_tasks)
+
+
+# --- EscrowAgent: claim / dispute / auto-release / expiry (§4.5, §4.6, R6/R15) --
+
+
+@pytest.mark.asyncio
+async def test_claim_by_bound_payee_starts_challenge_window():
+    clock = {"now": 1_000_000}
+    agent = EscrowAgent(now_ms=lambda: clock["now"])
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn, payee_conn), serve_tasks = await _wire(agent, BUYER_ID, PAYEE_ID)
+
+    async with buyer_conn, payee_conn:
+        buyer_escrow = EscrowClient(buyer_conn)
+        payee_escrow = EscrowClient(payee_conn)
+        locked = await buyer_escrow.lock(
+            0.005, valid_until_ms=FAR_FUTURE_MS, challenge_window_ms=60_000
+        )
+        await buyer_escrow.bind(locked.escrow_id, PAYEE_ID)
+
+        claimed = await payee_escrow.claim(
+            locked.escrow_id, 0.003, "task_1", {"method": "result-hash", "hash": "sha256:x"}
+        )
+
+    assert claimed.state == "claimed"
+    assert claimed.claim["amount_cu"] == 0.003
+    assert claimed.claim["window_ends_ms"] == 1_060_000
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_claim_by_non_payee_raises_not_authorized():
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn, stranger_conn), serve_tasks = await _wire(agent, BUYER_ID, "agent:stranger:test")
+
+    async with buyer_conn, stranger_conn:
+        buyer_escrow = EscrowClient(buyer_conn)
+        locked = await buyer_escrow.lock(0.005, valid_until_ms=FAR_FUTURE_MS)
+        await buyer_escrow.bind(locked.escrow_id, PAYEE_ID)
+
+        with pytest.raises(AcmpError) as exc_info:
+            await EscrowClient(stranger_conn).claim(
+                locked.escrow_id, 0.003, "task_1", {"method": "result-hash", "hash": "sha256:x"}
+            )
+
+    assert exc_info.value.code == EscrowErrorCode.NOT_AUTHORIZED
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_claim_on_unbound_escrow_raises_not_authorized():
+    """§4.5: escrow_id MUST be bound — an unbound escrow has no valid payee."""
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn, payee_conn), serve_tasks = await _wire(agent, BUYER_ID, PAYEE_ID)
+
+    async with buyer_conn, payee_conn:
+        locked = await EscrowClient(buyer_conn).lock(0.005, valid_until_ms=FAR_FUTURE_MS)
+
+        with pytest.raises(AcmpError) as exc_info:
+            await EscrowClient(payee_conn).claim(
+                locked.escrow_id, 0.003, "task_1", {"method": "result-hash", "hash": "sha256:x"}
+            )
+
+    assert exc_info.value.code == EscrowErrorCode.NOT_AUTHORIZED
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_claim_exceeding_remaining_raises_amount_exceeds_remaining():
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn, payee_conn), serve_tasks = await _wire(agent, BUYER_ID, PAYEE_ID)
+
+    async with buyer_conn, payee_conn:
+        locked = await EscrowClient(buyer_conn).lock(
+            0.005, valid_until_ms=FAR_FUTURE_MS, payee_id=PAYEE_ID
+        )
+
+        with pytest.raises(AcmpError) as exc_info:
+            await EscrowClient(payee_conn).claim(
+                locked.escrow_id, 0.006, "task_1", {"method": "result-hash", "hash": "sha256:x"}
+            )
+
+    assert exc_info.value.code == EscrowErrorCode.AMOUNT_EXCEEDS_REMAINING
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_second_claim_while_pending_raises_invalid_state():
+    """§4.5: one claim may be pending at a time."""
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn, payee_conn), serve_tasks = await _wire(agent, BUYER_ID, PAYEE_ID)
+
+    async with buyer_conn, payee_conn:
+        payee_escrow = EscrowClient(payee_conn)
+        locked = await EscrowClient(buyer_conn).lock(
+            0.005, valid_until_ms=FAR_FUTURE_MS, payee_id=PAYEE_ID
+        )
+        await payee_escrow.claim(
+            locked.escrow_id, 0.002, "task_1", {"method": "result-hash", "hash": "sha256:x"}
+        )
+
+        with pytest.raises(AcmpError) as exc_info:
+            await payee_escrow.claim(
+                locked.escrow_id, 0.001, "task_2", {"method": "result-hash", "hash": "sha256:y"}
+            )
+
+    assert exc_info.value.code == EscrowErrorCode.INVALID_STATE
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_claim_auto_releases_after_challenge_window_elapses():
+    """§4.5 safety path: an unchallenged claim auto-releases once its window
+    ends — driven by the injected clock, no wall-clock waiting."""
+    clock = {"now": 1_000_000}
+    agent = EscrowAgent(now_ms=lambda: clock["now"])
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn, payee_conn), serve_tasks = await _wire(agent, BUYER_ID, PAYEE_ID)
+
+    async with buyer_conn, payee_conn:
+        buyer_escrow = EscrowClient(buyer_conn)
+        payee_escrow = EscrowClient(payee_conn)
+        locked = await buyer_escrow.lock(
+            0.005, valid_until_ms=FAR_FUTURE_MS, payee_id=PAYEE_ID, challenge_window_ms=60_000
+        )
+        await payee_escrow.claim(
+            locked.escrow_id, 0.003, "task_1", {"method": "result-hash", "hash": "sha256:x"}
+        )
+        clock["now"] = 1_060_001  # past window_ends_ms
+
+        status = await buyer_escrow.status(locked.escrow_id)
+
+    assert status.state == "open"  # remainder still open
+    assert status.released_cu == 0.003
+    assert status.remaining_cu == pytest.approx(0.002)
+    assert status.claim is None
+    assert agent.ledger.balance(PAYEE_ID) == pytest.approx(0.003)
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_claim_auto_release_closes_escrow_when_fully_claimed():
+    clock = {"now": 1_000_000}
+    agent = EscrowAgent(now_ms=lambda: clock["now"])
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn, payee_conn), serve_tasks = await _wire(agent, BUYER_ID, PAYEE_ID)
+
+    async with buyer_conn, payee_conn:
+        buyer_escrow = EscrowClient(buyer_conn)
+        payee_escrow = EscrowClient(payee_conn)
+        locked = await buyer_escrow.lock(
+            0.005, valid_until_ms=FAR_FUTURE_MS, payee_id=PAYEE_ID, challenge_window_ms=60_000
+        )
+        await payee_escrow.claim(
+            locked.escrow_id, 0.005, "task_1", {"method": "result-hash", "hash": "sha256:x"}
+        )
+        clock["now"] = 1_060_001
+
+        status = await buyer_escrow.status(locked.escrow_id)
+
+    assert status.state == "closed"
+    assert status.remaining_cu == 0
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_dispute_by_non_buyer_raises_not_authorized():
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn, payee_conn), serve_tasks = await _wire(agent, BUYER_ID, PAYEE_ID)
+
+    async with buyer_conn, payee_conn:
+        payee_escrow = EscrowClient(payee_conn)
+        locked = await EscrowClient(buyer_conn).lock(
+            0.005, valid_until_ms=FAR_FUTURE_MS, payee_id=PAYEE_ID
+        )
+        await payee_escrow.claim(
+            locked.escrow_id, 0.003, "task_1", {"method": "result-hash", "hash": "sha256:x"}
+        )
+
+        with pytest.raises(AcmpError) as exc_info:
+            await payee_escrow.dispute(locked.escrow_id, "not my proof")
+
+    assert exc_info.value.code == EscrowErrorCode.NOT_AUTHORIZED
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_dispute_when_not_claimed_raises_invalid_state():
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn,), serve_tasks = await _wire(agent, BUYER_ID)
+
+    async with buyer_conn:
+        escrow = EscrowClient(buyer_conn)
+        locked = await escrow.lock(0.005, valid_until_ms=FAR_FUTURE_MS)
+
+        with pytest.raises(AcmpError) as exc_info:
+            await escrow.dispute(locked.escrow_id, "nothing to dispute yet")
+
+    assert exc_info.value.code == EscrowErrorCode.INVALID_STATE
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_dispute_freezes_escrow_and_blocks_release_and_reclaim():
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn, payee_conn), serve_tasks = await _wire(agent, BUYER_ID, PAYEE_ID)
+
+    async with buyer_conn, payee_conn:
+        buyer_escrow = EscrowClient(buyer_conn)
+        payee_escrow = EscrowClient(payee_conn)
+        locked = await buyer_escrow.lock(
+            0.005, valid_until_ms=FAR_FUTURE_MS, payee_id=PAYEE_ID
+        )
+        await payee_escrow.claim(
+            locked.escrow_id, 0.003, "task_1", {"method": "result-hash", "hash": "sha256:x"}
+        )
+
+        disputed = await buyer_escrow.dispute(locked.escrow_id, "output did not match input")
+        assert disputed == {"escrow_id": locked.escrow_id, "state": "disputed"}
+
+        status = await buyer_escrow.status(locked.escrow_id)
+        assert status.state == "disputed"
+        assert status.dispute == {"reason": "output did not match input"}
+
+        with pytest.raises(AcmpError) as release_exc:
+            await buyer_escrow.release(locked.escrow_id, 0.003, PAYEE_ID)
+        with pytest.raises(AcmpError) as reclaim_exc:
+            await buyer_escrow.reclaim(locked.escrow_id)
+
+    assert release_exc.value.code == EscrowErrorCode.INVALID_STATE
+    assert reclaim_exc.value.code == EscrowErrorCode.INVALID_STATE
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_dispute_suspends_auto_release_even_past_window():
+    """A disputed claim must not auto-release just because its window has
+    since elapsed — resolution is agent policy (§4.6), not the clock."""
+    clock = {"now": 1_000_000}
+    agent = EscrowAgent(now_ms=lambda: clock["now"])
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn, payee_conn), serve_tasks = await _wire(agent, BUYER_ID, PAYEE_ID)
+
+    async with buyer_conn, payee_conn:
+        buyer_escrow = EscrowClient(buyer_conn)
+        payee_escrow = EscrowClient(payee_conn)
+        locked = await buyer_escrow.lock(
+            0.005, valid_until_ms=FAR_FUTURE_MS, payee_id=PAYEE_ID, challenge_window_ms=60_000
+        )
+        await payee_escrow.claim(
+            locked.escrow_id, 0.003, "task_1", {"method": "result-hash", "hash": "sha256:x"}
+        )
+        await buyer_escrow.dispute(locked.escrow_id, "disagree")
+        clock["now"] = 1_060_001  # past the original window
+
+        status = await buyer_escrow.status(locked.escrow_id)
+
+    assert status.state == "disputed"  # not auto-released
+    assert agent.ledger.balance(PAYEE_ID) == 0
+    await asyncio.gather(*serve_tasks)

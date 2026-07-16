@@ -15,6 +15,7 @@ from .dag import (
 )
 from .errors import AcmpError, ErrorCode, EscrowErrorCode
 from .escrow import (
+    ClaimResult,
     CreditLedger,
     Escrow,
     EscrowAgent,
@@ -43,6 +44,7 @@ __all__ = [
     "AcceptedOffer",
     "AcmpError",
     "Buyer",
+    "ClaimResult",
     "CreditLedger",
     "Dag",
     "DagOrchestrator",

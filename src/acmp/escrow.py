@@ -226,6 +226,8 @@ class EscrowAgent:
             "acmp/escrowBind": self._handle_bind,
             "acmp/escrowRelease": self._handle_release,
             "acmp/escrowReclaim": self._handle_reclaim,
+            "acmp/escrowClaim": self._handle_claim,
+            "acmp/escrowDispute": self._handle_dispute,
             "acmp/escrowStatus": self._handle_status,
         }.get(method)
 
@@ -530,6 +532,77 @@ class EscrowAgent:
 
         return self._run_cached(esc, op_ref, op)
 
+    # -- acmp/escrowClaim -------------------------------------------------------
+
+    def _handle_claim(self, party_id: str, params: dict[str, Any]) -> dict[str, Any]:
+        escrow_id = params["escrow_id"]
+        esc = self._get_escrow(escrow_id)
+        op_ref = params["op_ref"]
+
+        def op() -> dict[str, Any]:
+            self._effective_state(esc)
+            if esc.expired:
+                raise AcmpError(EscrowErrorCode.ESCROW_EXPIRED, data={"escrow_id": escrow_id})
+            # §4.5: MUST be bound, and the caller MUST be the bound payee.
+            self._require_payee(esc, party_id)
+
+            if esc.state is not EscrowState.OPEN:
+                # Also covers "one claim may be pending at a time" — once
+                # claimed, the state is no longer open.
+                raise AcmpError(
+                    EscrowErrorCode.INVALID_STATE,
+                    data={"escrow_id": escrow_id, "state": esc.state.value},
+                )
+
+            amount_cu = params["amount_cu"]
+            if amount_cu > esc.remaining_cu:
+                raise AcmpError(
+                    EscrowErrorCode.AMOUNT_EXCEEDS_REMAINING, data={"escrow_id": escrow_id}
+                )
+
+            esc.claim = Claim(
+                amount_cu=amount_cu,
+                task_id=params["task_id"],
+                proof=params["proof"],
+                window_ends_ms=self._now_ms() + esc.challenge_window_ms,
+            )
+            esc.state = EscrowState.CLAIMED
+            return {
+                "escrow_id": escrow_id,
+                "state": esc.state.value,
+                "claim": esc.claim.to_dict(),
+            }
+
+        return self._run_cached(esc, op_ref, op)
+
+    # -- acmp/escrowDispute -----------------------------------------------------
+
+    def _handle_dispute(self, party_id: str, params: dict[str, Any]) -> dict[str, Any]:
+        escrow_id = params["escrow_id"]
+        esc = self._get_escrow(escrow_id)
+        op_ref = params["op_ref"]
+
+        def op() -> dict[str, Any]:
+            self._effective_state(esc)
+            if esc.expired:
+                raise AcmpError(EscrowErrorCode.ESCROW_EXPIRED, data={"escrow_id": escrow_id})
+            self._require_buyer(esc, party_id)
+
+            if esc.state is not EscrowState.CLAIMED:
+                # Includes the case where the challenge window already
+                # elapsed: _effective_state above auto-released it before
+                # this check runs, so a late dispute correctly lands here.
+                raise AcmpError(
+                    EscrowErrorCode.INVALID_STATE,
+                    data={"escrow_id": escrow_id, "state": esc.state.value},
+                )
+
+            esc.dispute = Dispute(reason=params["reason"], evidence=params.get("evidence"))
+            esc.state = EscrowState.DISPUTED
+            return {"escrow_id": escrow_id, "state": esc.state.value}
+
+        return self._run_cached(esc, op_ref, op)
+
     # -- acmp/escrowStatus ----------------------------------------------------
 
     def _handle_status(self, party_id: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -605,6 +678,19 @@ class ReclaimResult:
             remaining_cu=d["remaining_cu"],
             state=d["state"],
         )
+
+
+@dataclass
+class ClaimResult:
+    """The result of ``acmp/escrowClaim`` (§4.5)."""
+
+    escrow_id: str
+    state: str
+    claim: dict[str, Any]
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ClaimResult":
+        return cls(escrow_id=d["escrow_id"], state=d["state"], claim=d["claim"])
 
 
 @dataclass
@@ -736,6 +822,46 @@ class EscrowClient:
             params["amount_cu"] = amount_cu
         result = await self._buyer.request("acmp/escrowReclaim", params)
         return ReclaimResult.from_dict(result)
+
+    async def claim(
+        self,
+        escrow_id: str,
+        amount_cu: float,
+        task_id: str,
+        proof: dict[str, Any],
+        *,
+        op_ref: str | None = None,
+    ) -> ClaimResult:
+        """Send ``acmp/escrowClaim`` (§4.5): the safety path for a silent or
+        unresponsive buyer — starts the challenge window."""
+        params: dict[str, Any] = {
+            "op_ref": op_ref or new_op_ref(),
+            "escrow_id": escrow_id,
+            "amount_cu": amount_cu,
+            "task_id": task_id,
+            "proof": proof,
+        }
+        result = await self._buyer.request("acmp/escrowClaim", params)
+        return ClaimResult.from_dict(result)
+
+    async def dispute(
+        self,
+        escrow_id: str,
+        reason: str,
+        *,
+        evidence: dict[str, Any] | None = None,
+        op_ref: str | None = None,
+    ) -> dict[str, Any]:
+        """Send ``acmp/escrowDispute`` (§4.6): contest a pending claim before
+        its challenge window elapses."""
+        params: dict[str, Any] = {
+            "op_ref": op_ref or new_op_ref(),
+            "escrow_id": escrow_id,
+            "reason": reason,
+        }
+        if evidence is not None:
+            params["evidence"] = evidence
+        return await self._buyer.request("acmp/escrowDispute", params)
 
     async def status(self, escrow_id: str) -> StatusResult:
         """Send ``acmp/escrowStatus`` (§4.7): callable by buyer or bound payee."""

@@ -224,6 +224,8 @@ class EscrowAgent:
         handler = {
             "acmp/escrowLock": self._handle_lock,
             "acmp/escrowBind": self._handle_bind,
+            "acmp/escrowRelease": self._handle_release,
+            "acmp/escrowReclaim": self._handle_reclaim,
             "acmp/escrowStatus": self._handle_status,
         }.get(method)
 
@@ -410,6 +412,124 @@ class EscrowAgent:
 
         return self._run_cached(esc, op_ref, op)
 
+    # -- acmp/escrowRelease ---------------------------------------------------
+
+    def _handle_release(self, party_id: str, params: dict[str, Any]) -> dict[str, Any]:
+        escrow_id = params["escrow_id"]
+        esc = self._get_escrow(escrow_id)
+        op_ref = params["op_ref"]
+
+        def op() -> dict[str, Any]:
+            self._effective_state(esc)
+            if esc.expired:
+                raise AcmpError(EscrowErrorCode.ESCROW_EXPIRED, data={"escrow_id": escrow_id})
+            self._require_buyer(esc, party_id)
+
+            if esc.state not in (EscrowState.OPEN, EscrowState.CLAIMED):
+                raise AcmpError(
+                    EscrowErrorCode.INVALID_STATE,
+                    data={"escrow_id": escrow_id, "state": esc.state.value},
+                )
+
+            amount_cu = params["amount_cu"]
+            payee_id = params["payee_id"]
+            resolves_claim = esc.state is EscrowState.CLAIMED
+
+            if resolves_claim:
+                assert esc.claim is not None
+                if amount_cu < esc.claim.amount_cu:
+                    # §4.3: a buyer who believes less is owed must dispute,
+                    # not undercut a pending claim with a smaller release.
+                    raise AcmpError(
+                        EscrowErrorCode.INVALID_STATE,
+                        data={
+                            "escrow_id": escrow_id,
+                            "detail": "release below pending claim amount; dispute instead",
+                        },
+                    )
+
+            # §4.3: payee_id MUST equal the bound payee; an unbound escrow is
+            # implicitly bound by this release.
+            if esc.payee_id is not None and payee_id != esc.payee_id:
+                raise AcmpError(EscrowErrorCode.NOT_AUTHORIZED, data={"escrow_id": escrow_id})
+            if amount_cu > esc.remaining_cu:
+                raise AcmpError(
+                    EscrowErrorCode.AMOUNT_EXCEEDS_REMAINING, data={"escrow_id": escrow_id}
+                )
+
+            # All checks passed — mutate.
+            if esc.payee_id is None:
+                esc.payee_id = payee_id
+            if resolves_claim:
+                esc.claim = None  # fast-forward: this release resolves the claim
+            esc.released_cu += amount_cu
+            esc.had_settlement = True
+            esc.state = EscrowState.CLOSED if esc.remaining_cu <= 0 else EscrowState.OPEN
+            self._ledger.payout(escrow_id, f"release:{op_ref}", payee_id, amount_cu)
+
+            return {
+                "escrow_id": escrow_id,
+                "released_cu": amount_cu,
+                "remaining_cu": esc.remaining_cu,
+                "state": esc.state.value,
+            }
+
+        return self._run_cached(esc, op_ref, op)
+
+    # -- acmp/escrowReclaim ---------------------------------------------------
+
+    def _handle_reclaim(self, party_id: str, params: dict[str, Any]) -> dict[str, Any]:
+        escrow_id = params["escrow_id"]
+        esc = self._get_escrow(escrow_id)
+        op_ref = params["op_ref"]
+
+        def op() -> dict[str, Any]:
+            self._effective_state(esc)
+            if esc.expired:
+                raise AcmpError(EscrowErrorCode.ESCROW_EXPIRED, data={"escrow_id": escrow_id})
+            self._require_buyer(esc, party_id)
+
+            if esc.state is not EscrowState.OPEN:
+                # A pending claim (or dispute) blocks reclaim — a provider's
+                # in-flight claim cannot be undercut (§4.4).
+                raise AcmpError(
+                    EscrowErrorCode.INVALID_STATE,
+                    data={"escrow_id": escrow_id, "state": esc.state.value},
+                )
+            if esc.payee_id is not None and not esc.had_settlement:
+                # Bound-escrow guard (§4.4): without it a buyer could drain
+                # the escrow mid-task and beat the provider's claim to the
+                # punch. Unbound escrows are reclaimable freely.
+                raise AcmpError(
+                    EscrowErrorCode.INVALID_STATE,
+                    data={
+                        "escrow_id": escrow_id,
+                        "detail": "bound escrow requires a settlement before reclaim",
+                    },
+                )
+
+            amount_cu = params.get("amount_cu")
+            if amount_cu is None:
+                amount_cu = esc.remaining_cu
+            elif amount_cu > esc.remaining_cu:
+                raise AcmpError(
+                    EscrowErrorCode.AMOUNT_EXCEEDS_REMAINING, data={"escrow_id": escrow_id}
+                )
+
+            esc.reclaimed_cu += amount_cu
+            esc.state = EscrowState.CLOSED if esc.remaining_cu <= 0 else EscrowState.OPEN
+            if amount_cu > 0:
+                self._ledger.payout(escrow_id, f"reclaim:{op_ref}", esc.buyer_id, amount_cu)
+
+            return {
+                "escrow_id": escrow_id,
+                "reclaimed_cu": amount_cu,
+                "remaining_cu": esc.remaining_cu,
+                "state": esc.state.value,
+            }
+
+        return self._run_cached(esc, op_ref, op)
+
     # -- acmp/escrowStatus ----------------------------------------------------
 
     def _handle_status(self, party_id: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -446,6 +566,44 @@ class LockResult:
             state=d["state"],
             amount_cu=d["amount_cu"],
             valid_until_ms=d["valid_until_ms"],
+        )
+
+
+@dataclass
+class ReleaseResult:
+    """The result of ``acmp/escrowRelease`` (§4.3)."""
+
+    escrow_id: str
+    released_cu: float
+    remaining_cu: float
+    state: str
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ReleaseResult":
+        return cls(
+            escrow_id=d["escrow_id"],
+            released_cu=d["released_cu"],
+            remaining_cu=d["remaining_cu"],
+            state=d["state"],
+        )
+
+
+@dataclass
+class ReclaimResult:
+    """The result of ``acmp/escrowReclaim`` (§4.4)."""
+
+    escrow_id: str
+    reclaimed_cu: float
+    remaining_cu: float
+    state: str
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ReclaimResult":
+        return cls(
+            escrow_id=d["escrow_id"],
+            reclaimed_cu=d["reclaimed_cu"],
+            remaining_cu=d["remaining_cu"],
+            state=d["state"],
         )
 
 
@@ -534,6 +692,50 @@ class EscrowClient:
         if challenge_window_ms is not None:
             params["challenge_window_ms"] = challenge_window_ms
         return await self._buyer.request("acmp/escrowBind", params)
+
+    async def release(
+        self,
+        escrow_id: str,
+        amount_cu: float,
+        payee_id: str,
+        *,
+        task_id: str | None = None,
+        proof: dict[str, Any] | None = None,
+        op_ref: str | None = None,
+    ) -> ReleaseResult:
+        """Send ``acmp/escrowRelease`` (§4.3): pay out against verified proof.
+
+        Also the fast-forward path for a pending claim (``amount_cu`` must be
+        ≥ the claimed amount) and the implicit-bind path for an unbound
+        escrow.
+        """
+        params: dict[str, Any] = {
+            "op_ref": op_ref or new_op_ref(),
+            "escrow_id": escrow_id,
+            "amount_cu": amount_cu,
+            "payee_id": payee_id,
+        }
+        if task_id is not None:
+            params["task_id"] = task_id
+        if proof is not None:
+            params["proof"] = proof
+        result = await self._buyer.request("acmp/escrowRelease", params)
+        return ReleaseResult.from_dict(result)
+
+    async def reclaim(
+        self,
+        escrow_id: str,
+        *,
+        amount_cu: float | None = None,
+        op_ref: str | None = None,
+    ) -> ReclaimResult:
+        """Send ``acmp/escrowReclaim`` (§4.4). Omitting ``amount_cu`` reclaims
+        the entire remaining balance."""
+        params: dict[str, Any] = {"op_ref": op_ref or new_op_ref(), "escrow_id": escrow_id}
+        if amount_cu is not None:
+            params["amount_cu"] = amount_cu
+        result = await self._buyer.request("acmp/escrowReclaim", params)
+        return ReclaimResult.from_dict(result)
 
     async def status(self, escrow_id: str) -> StatusResult:
         """Send ``acmp/escrowStatus`` (§4.7): callable by buyer or bound payee."""

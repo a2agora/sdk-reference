@@ -14,6 +14,7 @@ import pytest
 from acmp import AcmpError, Buyer, EscrowErrorCode, InMemoryTransport
 from acmp.escrow import (
     DEFAULT_CHALLENGE_WINDOW_MS,
+    Claim,
     CreditLedger,
     Escrow,
     EscrowAgent,
@@ -399,4 +400,300 @@ async def test_expired_escrow_rejects_further_ops_with_escrow_expired():
             await escrow.bind(locked.escrow_id, PAYEE_ID)
 
     assert exc_info.value.code == EscrowErrorCode.ESCROW_EXPIRED
+    await asyncio.gather(*serve_tasks)
+
+
+# --- EscrowAgent: release / reclaim + bound-escrow guard (§4.3, §4.4) ----------
+
+
+def _put_in_claimed(
+    agent: EscrowAgent,
+    escrow_id: str,
+    amount_cu: float,
+    *,
+    task_id: str = "task_x",
+    window_ends_ms: int = FAR_FUTURE_MS,
+) -> None:
+    """White-box helper: drop an escrow directly into ``claimed``, ahead of
+    Task 6's real ``escrowClaim`` handler — exercises the release-side
+    fast-forward path (§4.3) in isolation."""
+    esc = agent._escrows[escrow_id]
+    esc.state = EscrowState.CLAIMED
+    esc.claim = Claim(
+        amount_cu=amount_cu,
+        task_id=task_id,
+        proof={"method": "result-hash", "hash": "sha256:x"},
+        window_ends_ms=window_ends_ms,
+    )
+
+
+@pytest.mark.asyncio
+async def test_release_partial_then_reclaim_remainder_closes_escrow():
+    """The RFC-0001 happy path: lock 0.005 -> release 0.003 -> reclaim 0.002
+    -> closed."""
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn,), serve_tasks = await _wire(agent, BUYER_ID)
+
+    async with buyer_conn:
+        escrow = EscrowClient(buyer_conn)
+        locked = await escrow.lock(0.005, valid_until_ms=FAR_FUTURE_MS)
+        await escrow.bind(locked.escrow_id, PAYEE_ID)
+
+        released = await escrow.release(locked.escrow_id, 0.003, PAYEE_ID)
+        assert released.released_cu == 0.003
+        assert released.remaining_cu == pytest.approx(0.002)
+        assert released.state == "open"
+
+        reclaimed = await escrow.reclaim(locked.escrow_id)
+        assert reclaimed.reclaimed_cu == pytest.approx(0.002)
+        assert reclaimed.remaining_cu == 0
+        assert reclaimed.state == "closed"
+
+    assert agent.ledger.balance(PAYEE_ID) == pytest.approx(0.003)
+    assert agent.ledger.balance(BUYER_ID) == pytest.approx(0.997)  # 1.0 - 0.003 net
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_release_on_unbound_escrow_binds_implicitly():
+    """§4.3: a release on an unbound escrow binds payee_id implicitly."""
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn,), serve_tasks = await _wire(agent, BUYER_ID)
+
+    async with buyer_conn:
+        escrow = EscrowClient(buyer_conn)
+        locked = await escrow.lock(0.005, valid_until_ms=FAR_FUTURE_MS)  # no payee at lock
+
+        await escrow.release(locked.escrow_id, 0.003, PAYEE_ID)
+        status = await escrow.status(locked.escrow_id)
+
+    assert status.payee_id == PAYEE_ID
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_release_payee_mismatch_on_bound_escrow_raises_not_authorized():
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn,), serve_tasks = await _wire(agent, BUYER_ID)
+
+    async with buyer_conn:
+        escrow = EscrowClient(buyer_conn)
+        locked = await escrow.lock(0.005, valid_until_ms=FAR_FUTURE_MS)
+        await escrow.bind(locked.escrow_id, PAYEE_ID)
+
+        with pytest.raises(AcmpError) as exc_info:
+            await escrow.release(locked.escrow_id, 0.003, "agent:someone-else:test")
+
+    assert exc_info.value.code == EscrowErrorCode.NOT_AUTHORIZED
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_release_exceeding_remaining_raises_amount_exceeds_remaining():
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn,), serve_tasks = await _wire(agent, BUYER_ID)
+
+    async with buyer_conn:
+        escrow = EscrowClient(buyer_conn)
+        locked = await escrow.lock(0.005, valid_until_ms=FAR_FUTURE_MS)
+
+        with pytest.raises(AcmpError) as exc_info:
+            await escrow.release(locked.escrow_id, 0.006, PAYEE_ID)
+
+    assert exc_info.value.code == EscrowErrorCode.AMOUNT_EXCEEDS_REMAINING
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_release_below_claim_amount_raises_invalid_state():
+    """§4.3: a buyer who believes less is owed must dispute, not undercut a
+    pending claim with a smaller release."""
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn,), serve_tasks = await _wire(agent, BUYER_ID)
+
+    async with buyer_conn:
+        escrow = EscrowClient(buyer_conn)
+        locked = await escrow.lock(0.005, valid_until_ms=FAR_FUTURE_MS, payee_id=PAYEE_ID)
+        _put_in_claimed(agent, locked.escrow_id, amount_cu=0.003)
+
+        with pytest.raises(AcmpError) as exc_info:
+            await escrow.release(locked.escrow_id, 0.002, PAYEE_ID)
+
+    assert exc_info.value.code == EscrowErrorCode.INVALID_STATE
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_release_above_claim_amount_fast_forwards_and_pays_surplus():
+    """§4.3: a release ≥ the claimed amount resolves the claim; the surplus
+    above the claim is paid out as a normal partial release."""
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn,), serve_tasks = await _wire(agent, BUYER_ID)
+
+    async with buyer_conn:
+        escrow = EscrowClient(buyer_conn)
+        locked = await escrow.lock(0.005, valid_until_ms=FAR_FUTURE_MS, payee_id=PAYEE_ID)
+        _put_in_claimed(agent, locked.escrow_id, amount_cu=0.003)
+
+        released = await escrow.release(locked.escrow_id, 0.004, PAYEE_ID)
+
+    assert released.released_cu == 0.004
+    assert released.remaining_cu == pytest.approx(0.001)
+    assert released.state == "open"
+    assert agent.escrow(locked.escrow_id).claim is None  # claim resolved
+    assert agent.ledger.balance(PAYEE_ID) == pytest.approx(0.004)  # full amount, not just the claim
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_reclaim_default_amount_is_entire_remaining_balance():
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn,), serve_tasks = await _wire(agent, BUYER_ID)
+
+    async with buyer_conn:
+        escrow = EscrowClient(buyer_conn)
+        locked = await escrow.lock(0.005, valid_until_ms=FAR_FUTURE_MS)
+
+        reclaimed = await escrow.reclaim(locked.escrow_id)
+
+    assert reclaimed.reclaimed_cu == pytest.approx(0.005)
+    assert reclaimed.remaining_cu == 0
+    assert reclaimed.state == "closed"
+    assert agent.ledger.balance(BUYER_ID) == pytest.approx(1.0)
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_reclaim_exceeding_remaining_raises_amount_exceeds_remaining():
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn,), serve_tasks = await _wire(agent, BUYER_ID)
+
+    async with buyer_conn:
+        escrow = EscrowClient(buyer_conn)
+        locked = await escrow.lock(0.005, valid_until_ms=FAR_FUTURE_MS)
+
+        with pytest.raises(AcmpError) as exc_info:
+            await escrow.reclaim(locked.escrow_id, amount_cu=0.006)
+
+    assert exc_info.value.code == EscrowErrorCode.AMOUNT_EXCEEDS_REMAINING
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_reclaim_on_unbound_escrow_is_free_at_any_time():
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn,), serve_tasks = await _wire(agent, BUYER_ID)
+
+    async with buyer_conn:
+        escrow = EscrowClient(buyer_conn)
+        locked = await escrow.lock(0.005, valid_until_ms=FAR_FUTURE_MS)  # never bound
+
+        reclaimed = await escrow.reclaim(locked.escrow_id)
+
+    assert reclaimed.state == "closed"
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_reclaim_on_bound_escrow_before_settlement_raises_invalid_state():
+    """Bound-escrow guard (§4.4): a buyer cannot drain a bound escrow before
+    a first release or resolved claim — that would let them win the race
+    against the provider's claim."""
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn,), serve_tasks = await _wire(agent, BUYER_ID)
+
+    async with buyer_conn:
+        escrow = EscrowClient(buyer_conn)
+        locked = await escrow.lock(0.005, valid_until_ms=FAR_FUTURE_MS)
+        await escrow.bind(locked.escrow_id, PAYEE_ID)
+
+        with pytest.raises(AcmpError) as exc_info:
+            await escrow.reclaim(locked.escrow_id)
+
+    assert exc_info.value.code == EscrowErrorCode.INVALID_STATE
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_reclaim_on_bound_escrow_after_release_succeeds():
+    """The guard lifts once a settlement (release) has occurred."""
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn,), serve_tasks = await _wire(agent, BUYER_ID)
+
+    async with buyer_conn:
+        escrow = EscrowClient(buyer_conn)
+        locked = await escrow.lock(0.005, valid_until_ms=FAR_FUTURE_MS)
+        await escrow.bind(locked.escrow_id, PAYEE_ID)
+        await escrow.release(locked.escrow_id, 0.001, PAYEE_ID)
+
+        reclaimed = await escrow.reclaim(locked.escrow_id)
+
+    assert reclaimed.reclaimed_cu == pytest.approx(0.004)
+    assert reclaimed.state == "closed"
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_reclaim_while_claimed_raises_invalid_state():
+    """§4.4: a pending claim blocks reclaim outright."""
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn,), serve_tasks = await _wire(agent, BUYER_ID)
+
+    async with buyer_conn:
+        escrow = EscrowClient(buyer_conn)
+        locked = await escrow.lock(0.005, valid_until_ms=FAR_FUTURE_MS, payee_id=PAYEE_ID)
+        _put_in_claimed(agent, locked.escrow_id, amount_cu=0.003)
+
+        with pytest.raises(AcmpError) as exc_info:
+            await escrow.reclaim(locked.escrow_id)
+
+    assert exc_info.value.code == EscrowErrorCode.INVALID_STATE
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_release_retry_with_same_op_ref_replays_result():
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn,), serve_tasks = await _wire(agent, BUYER_ID)
+
+    async with buyer_conn:
+        escrow = EscrowClient(buyer_conn)
+        locked = await escrow.lock(0.005, valid_until_ms=FAR_FUTURE_MS)
+        op_ref = "op_release_retry"
+        first = await escrow.release(locked.escrow_id, 0.003, PAYEE_ID, op_ref=op_ref)
+        second = await escrow.release(locked.escrow_id, 0.003, PAYEE_ID, op_ref=op_ref)
+
+    assert first == second
+    assert agent.ledger.balance(PAYEE_ID) == pytest.approx(0.003)  # paid once, not twice
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_reclaim_retry_with_same_op_ref_replays_result():
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn,), serve_tasks = await _wire(agent, BUYER_ID)
+
+    async with buyer_conn:
+        escrow = EscrowClient(buyer_conn)
+        locked = await escrow.lock(0.005, valid_until_ms=FAR_FUTURE_MS)
+        op_ref = "op_reclaim_retry"
+        first = await escrow.reclaim(locked.escrow_id, op_ref=op_ref)
+        second = await escrow.reclaim(locked.escrow_id, op_ref=op_ref)
+
+    assert first == second
+    assert agent.ledger.balance(BUYER_ID) == pytest.approx(1.0)  # refunded once, not twice
     await asyncio.gather(*serve_tasks)

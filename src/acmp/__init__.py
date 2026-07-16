@@ -22,6 +22,8 @@ from .escrow import (
     EscrowState,
     EscrowVerifier,
     LockResult,
+    ReclaimResult,
+    ReleaseResult,
     StatusResult,
 )
 from .escrow_stub import EscrowStub
@@ -65,6 +67,8 @@ __all__ = [
     "OfferRequest",
     "Payload",
     "Provider",
+    "ReclaimResult",
+    "ReleaseResult",
     "Result",
     "StatusResult",
     "Task",

@@ -14,6 +14,16 @@ from .dag import (
     InputRef,
 )
 from .errors import AcmpError, ErrorCode, EscrowErrorCode
+from .escrow import (
+    CreditLedger,
+    Escrow,
+    EscrowAgent,
+    EscrowClient,
+    EscrowState,
+    EscrowVerifier,
+    LockResult,
+    StatusResult,
+)
 from .escrow_stub import EscrowStub
 from .messages import ACMP_VERSION, Payload, Result, Task
 from .negotiation import (
@@ -31,6 +41,7 @@ __all__ = [
     "AcceptedOffer",
     "AcmpError",
     "Buyer",
+    "CreditLedger",
     "Dag",
     "DagOrchestrator",
     "DagResolutionError",
@@ -38,10 +49,16 @@ __all__ = [
     "DagValidationError",
     "Edge",
     "ErrorCode",
+    "Escrow",
+    "EscrowAgent",
+    "EscrowClient",
     "EscrowErrorCode",
+    "EscrowState",
     "EscrowStub",
+    "EscrowVerifier",
     "InMemoryTransport",
     "InputRef",
+    "LockResult",
     "NegotiationErrorCode",
     "Negotiator",
     "Offer",
@@ -49,6 +66,7 @@ __all__ = [
     "Payload",
     "Provider",
     "Result",
+    "StatusResult",
     "Task",
     "TaskContext",
     "Transport",

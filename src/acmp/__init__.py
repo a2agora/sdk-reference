@@ -27,7 +27,6 @@ from .escrow import (
     ReleaseResult,
     StatusResult,
 )
-from .escrow_stub import EscrowStub
 from .messages import ACMP_VERSION, Payload, Result, Task
 from .negotiation import (
     AcceptedOffer,
@@ -58,7 +57,6 @@ __all__ = [
     "EscrowClient",
     "EscrowErrorCode",
     "EscrowState",
-    "EscrowStub",
     "EscrowVerifier",
     "InMemoryTransport",
     "InputRef",

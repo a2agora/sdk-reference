@@ -275,12 +275,14 @@ class EscrowAgent:
             raise AcmpError(EscrowErrorCode.NOT_AUTHORIZED, data={"escrow_id": esc.escrow_id})
 
     def _run_cached(
-        self, esc: Escrow, op_ref: str, op: Callable[[], dict[str, Any]]
+        self, cache: dict[str, dict[str, Any]], op_ref: str, op: Callable[[], dict[str, Any]]
     ) -> dict[str, Any]:
-        """Idempotency for every escrow-scoped mutating op (§3): a repeated
-        ``op_ref`` replays the first outcome — success *or* error — instead
-        of re-running ``op``."""
-        cached = esc.op_results.get(op_ref)
+        """Idempotency (§3): a repeated ``op_ref`` replays the first outcome
+        — success *or* error — instead of re-running ``op``. Shared by every
+        mutating handler: ``cache`` is agent-wide (``escrowLock``, which has
+        no escrow yet to key a per-escrow cache off) or per-escrow
+        (``esc.op_results``, every other op)."""
+        cached = cache.get(op_ref)
         if cached is not None:
             if "error" in cached:
                 err = cached["error"]
@@ -289,9 +291,9 @@ class EscrowAgent:
         try:
             result = op()
         except AcmpError as err:
-            esc.op_results[op_ref] = {"error": err.to_jsonrpc()}
+            cache[op_ref] = {"error": err.to_jsonrpc()}
             raise
-        esc.op_results[op_ref] = {"result": result}
+        cache[op_ref] = {"result": result}
         return result
 
     # -- lazy time evaluation (§2 "Expiry", §4.5 auto-release) -----------------
@@ -316,6 +318,15 @@ class EscrowAgent:
         if esc.state is EscrowState.OPEN and esc.claim is None and esc.dispute is None:
             if now >= esc.valid_until_ms:
                 self._auto_reclaim_expiry(esc)
+
+    def _resolve_and_require_active(self, esc: Escrow) -> None:
+        """Resolve auto-transitions, then reject if expiry already closed
+        the escrow (-35004). Shared by every mutating handler except
+        ``escrowLock`` (no escrow exists yet) and ``escrowStatus`` (a
+        read-only query must still succeed on a closed escrow)."""
+        self._effective_state(esc)
+        if esc.expired:
+            raise AcmpError(EscrowErrorCode.ESCROW_EXPIRED, data={"escrow_id": esc.escrow_id})
 
     def _auto_release(self, esc: Escrow) -> None:
         """§4.5: unchallenged claim window elapsed — release the claimed
@@ -346,19 +357,7 @@ class EscrowAgent:
 
     def _handle_lock(self, party_id: str, params: dict[str, Any]) -> dict[str, Any]:
         op_ref = params["op_ref"]
-        cached = self._lock_ops.get(op_ref)
-        if cached is not None:
-            if "error" in cached:
-                err = cached["error"]
-                raise AcmpError(err["code"], err["message"], err.get("data"))
-            return cached["result"]
-        try:
-            result = self._do_lock(party_id, params)
-        except AcmpError as err:
-            self._lock_ops[op_ref] = {"error": err.to_jsonrpc()}
-            raise
-        self._lock_ops[op_ref] = {"result": result}
-        return result
+        return self._run_cached(self._lock_ops, op_ref, lambda: self._do_lock(party_id, params))
 
     def _do_lock(self, party_id: str, params: dict[str, Any]) -> dict[str, Any]:
         amount_cu = params["amount_cu"]
@@ -394,9 +393,7 @@ class EscrowAgent:
         op_ref = params["op_ref"]
 
         def op() -> dict[str, Any]:
-            self._effective_state(esc)
-            if esc.expired:
-                raise AcmpError(EscrowErrorCode.ESCROW_EXPIRED, data={"escrow_id": escrow_id})
+            self._resolve_and_require_active(esc)
             self._require_buyer(esc, party_id)
             if esc.payee_id is not None:
                 # Rebinding MUST be rejected (§4.2) — including a bind that
@@ -412,7 +409,7 @@ class EscrowAgent:
                 esc.challenge_window_ms = new_window
             return {"escrow_id": escrow_id, "payee_id": payee_id}
 
-        return self._run_cached(esc, op_ref, op)
+        return self._run_cached(esc.op_results, op_ref, op)
 
     # -- acmp/escrowRelease ---------------------------------------------------
 
@@ -422,9 +419,7 @@ class EscrowAgent:
         op_ref = params["op_ref"]
 
         def op() -> dict[str, Any]:
-            self._effective_state(esc)
-            if esc.expired:
-                raise AcmpError(EscrowErrorCode.ESCROW_EXPIRED, data={"escrow_id": escrow_id})
+            self._resolve_and_require_active(esc)
             self._require_buyer(esc, party_id)
 
             if esc.state not in (EscrowState.OPEN, EscrowState.CLAIMED):
@@ -476,7 +471,7 @@ class EscrowAgent:
                 "state": esc.state.value,
             }
 
-        return self._run_cached(esc, op_ref, op)
+        return self._run_cached(esc.op_results, op_ref, op)
 
     # -- acmp/escrowReclaim ---------------------------------------------------
 
@@ -486,9 +481,7 @@ class EscrowAgent:
         op_ref = params["op_ref"]
 
         def op() -> dict[str, Any]:
-            self._effective_state(esc)
-            if esc.expired:
-                raise AcmpError(EscrowErrorCode.ESCROW_EXPIRED, data={"escrow_id": escrow_id})
+            self._resolve_and_require_active(esc)
             self._require_buyer(esc, party_id)
 
             if esc.state is not EscrowState.OPEN:
@@ -530,7 +523,7 @@ class EscrowAgent:
                 "state": esc.state.value,
             }
 
-        return self._run_cached(esc, op_ref, op)
+        return self._run_cached(esc.op_results, op_ref, op)
 
     # -- acmp/escrowClaim -------------------------------------------------------
 
@@ -540,9 +533,7 @@ class EscrowAgent:
         op_ref = params["op_ref"]
 
         def op() -> dict[str, Any]:
-            self._effective_state(esc)
-            if esc.expired:
-                raise AcmpError(EscrowErrorCode.ESCROW_EXPIRED, data={"escrow_id": escrow_id})
+            self._resolve_and_require_active(esc)
             # §4.5: MUST be bound, and the caller MUST be the bound payee.
             self._require_payee(esc, party_id)
 
@@ -573,7 +564,7 @@ class EscrowAgent:
                 "claim": esc.claim.to_dict(),
             }
 
-        return self._run_cached(esc, op_ref, op)
+        return self._run_cached(esc.op_results, op_ref, op)
 
     # -- acmp/escrowDispute -----------------------------------------------------
 
@@ -583,9 +574,7 @@ class EscrowAgent:
         op_ref = params["op_ref"]
 
         def op() -> dict[str, Any]:
-            self._effective_state(esc)
-            if esc.expired:
-                raise AcmpError(EscrowErrorCode.ESCROW_EXPIRED, data={"escrow_id": escrow_id})
+            self._resolve_and_require_active(esc)
             self._require_buyer(esc, party_id)
 
             if esc.state is not EscrowState.CLAIMED:
@@ -601,7 +590,7 @@ class EscrowAgent:
             esc.state = EscrowState.DISPUTED
             return {"escrow_id": escrow_id, "state": esc.state.value}
 
-        return self._run_cached(esc, op_ref, op)
+        return self._run_cached(esc.op_results, op_ref, op)
 
     # -- acmp/escrowStatus ----------------------------------------------------
 

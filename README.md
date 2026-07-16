@@ -14,8 +14,8 @@ Market Protocol (ACMP)**, the economic layer defined by A2Agora
 
 This SDK exists to prove the protocol is implementable, not to be a
 production-grade agent framework. It follows the spec's Layer 1 (Transport &
-Invocation), Layer 2 (Task Decomposition Format), and Layer 6 (Negotiation
-Protocol) documents field-for-field.
+Invocation), Layer 2 (Task Decomposition Format), Layer 4 (Escrow &
+Settlement), and Layer 6 (Negotiation Protocol) documents field-for-field.
 
 ## Status
 
@@ -31,9 +31,17 @@ Protocol) documents field-for-field.
   automatic + manual heartbeats (`acmp/heartbeat`), cooperative cancellation
   (`acmp/cancel`), buyer-side `timeout_ms` enforcement, and -33007 feature
   gating.
+- **Stage 5 — Layer 4 escrow agent & a real network transport.** A genuine
+  `EscrowAgent` — lock/bind/release/reclaim/claim/dispute/status, the
+  four-state lifecycle, `op_ref` idempotency, the bound-escrow reclaim guard,
+  and the challenge-window auto-release and expiry auto-reclaim — served as
+  its own party, never shared in-process. Plus an optional WebSocket
+  transport, so buyer, provider, and Escrow Agent run as three real network
+  endpoints end-to-end.
 
-Further contributions (additional transports, streaming DAG edges) are
-welcome — see the notes below on what's intentionally out of scope so far.
+Further contributions (additional transports, streaming DAG edges,
+dispute-resolution mechanisms) are welcome — see the notes below on what's
+intentionally out of scope so far.
 
 ## Install
 
@@ -42,13 +50,23 @@ cd sdk-reference
 pip install -e ".[dev]"
 ```
 
+The core SDK (`src/acmp/`) has **no runtime dependencies**. The WebSocket
+transport (`acmp.ws_transport`, used by demo 05) is an opt-in extra —
+`pip install -e ".[dev]"` already includes it for running the tests, but on
+its own it's:
+
+```bash
+pip install -e ".[ws]"
+```
+
 ## Run the demos
 
 ```bash
 python examples/01_minimal_invoke.py       # Layer 1 only
-python examples/02_negotiated_invoke.py    # Layer 6 -> Layer 1
+python examples/02_negotiated_invoke.py    # Layer 6 -> Layer 1 -> Layer 4
 python examples/03_dag_pipeline.py         # Layer 2 DAG -> Layer 1 (concurrent)
 python examples/04_streaming_cancel.py     # streaming + heartbeats + cancel
+python examples/05_escrow_e2e.py           # Layer 4 escrow agent over real WebSockets (needs [ws])
 ```
 
 The first two spin up a provider offering a `sentiment-analysis`
@@ -58,9 +76,18 @@ capability — the same scenario as the worked example in
 The second demo additionally runs the offer/accept exchange from
 `spec/layers/06-negotiation-protocol.md`
 ([GitHub](https://github.com/a2agora/spec/blob/main/layers/06-negotiation-protocol.md) · [Codeberg](https://codeberg.org/a2agora/spec/src/branch/main/layers/06-negotiation-protocol.md))
-before invoking. The third demo runs the split → parallel sentiment →
+before invoking, then locks, binds, releases, and reclaims through a real
+`EscrowAgent` — the RFC-0001 happy-path numbers (lock 0.005, release 0.003,
+reclaim 0.002). The third demo runs the split → parallel sentiment →
 aggregate pipeline from `spec/layers/02-task-format.md` §6.2
 ([GitHub](https://github.com/a2agora/spec/blob/main/layers/02-task-format.md) · [Codeberg](https://codeberg.org/a2agora/spec/src/branch/main/layers/02-task-format.md)).
+The fifth demo is the full three-party topology of
+`spec/layers/04-escrow-settlement.md`
+([GitHub](https://github.com/a2agora/spec/blob/main/layers/04-escrow-settlement.md) · [Codeberg](https://codeberg.org/a2agora/spec/src/branch/main/layers/04-escrow-settlement.md))
+— buyer, provider, and Escrow Agent as three separate WebSocket connections
+— running both the happy path and the silent-buyer safety path (claim +
+challenge-window auto-release, via an injected clock rather than a real
+wait).
 
 ## Run the tests
 
@@ -72,13 +99,14 @@ pytest
 
 ```
 src/acmp/
-  errors.py       ACMP error codes (-33xxx) and the AcmpError exception
+  errors.py       ACMP error codes (-33xxx, -35xxx) and the AcmpError exception
   messages.py     Task/Payload/Result dataclasses + JSON-RPC framing helpers
   transport.py    Transport ABC + InMemoryTransport (paired in-process channel)
+  ws_transport.py Transport over a real websockets connection (optional, acmp[ws])
   provider.py     Capability registry, invoke/streaming/cancel dispatch, TaskContext
   buyer.py        invoke() with chunk/heartbeat callbacks, timeout, cancel, input chunks
   negotiation.py  Layer 6 offer request/offer/accept dataclasses + Negotiator
-  escrow_stub.py  Minimal in-memory stand-in for Layer 4 (not a real escrow)
+  escrow.py       Layer 4 EscrowAgent, EscrowClient, CreditLedger (the real escrow)
   dag.py          Layer 2 DAG/Edge/InputRef model + DagOrchestrator
 ```
 
@@ -102,11 +130,32 @@ Every module docstring cites the spec section it implements.
   omitting it means direct settlement), and offers carry the negotiated
   `challenge_window_ms` term. The offer `sig` envelope (Layer 7) is
   transported but not produced — this SDK has no key infrastructure.
-- **Escrow**: `EscrowStub` is *not* a Layer 4 implementation — it only
-  provides a real `escrow_id` for negotiation to hand to invoke, and lets a
-  provider demonstrate the `escrow_invalid` (-33005) check. The full Layer 4
-  draft (escrow agent role, claim/dispute, settlement rails) is unimplemented
-  here and listed as a contribution entry point.
+- **Escrow** (Layer 4, now `draft`): `EscrowAgent` is a genuine neutral third
+  party — served over its own `Transport` connection(s), never shared
+  in-process with buyer or provider, unlike the retired `EscrowStub`. It
+  implements the four-state lifecycle (`open → claimed → disputed → closed`),
+  all seven `acmp/escrow*` messages, `op_ref` idempotency (including a
+  dedicated agent-wide dedup for `escrowLock`, which has no `escrow_id` yet
+  to key a per-escrow cache off), party authorization (-35005), the
+  once-only bind (including a lock-time `payee_id` already counting as
+  bound), the claim fast-forward release rule (§4.3), the bound-escrow
+  reclaim guard (§4.4), and the challenge-window auto-release and expiry
+  auto-reclaim — both driven by an injectable clock so tests and demo 05's
+  safety-path scenario never wait on a real timer. `CreditLedger` implements
+  the §7.2 non-blockchain rail (P4): a plain funding/payout balance, with one
+  idempotent payout per `(escrow_id, transition)`. Dispute *resolution* is
+  out of scope (v0.1 leaves it to agent policy, per the spec); an `EscrowAgent`
+  only freezes a disputed escrow. `EscrowClient` is the buyer- or
+  provider-side wrapper (built the same way `Negotiator` wraps a `Buyer`) and
+  also satisfies the `EscrowVerifier` protocol a `Provider` uses for its
+  `escrow_invalid` (-33005) check.
+- **Transport**: `WebSocketTransport` (in the optional `acmp.ws_transport`
+  module, `pip install acmp[ws]`) implements the same `Transport` interface
+  as `InMemoryTransport` over a real socket — the SDK's core stays
+  dependency-light, and no core module imports it. `party_id` for an
+  `EscrowAgent` connection is read from a `?party_id=` query parameter on the
+  connection URL (self-reported, same as the in-memory demos — verifiable
+  identity binding is Layer 7's job).
 - **DAG execution** (Layer 2 §3): `DagOrchestrator` treats the DAG purely as
   a buyer-side plan — it is never sent over the wire. Providers only ever
   see individual, literal `acmp/invoke` tasks; `InputRef`s (the `source`

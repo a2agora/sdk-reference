@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import Any, Union
 
 from .errors import AcmpError, ErrorCode
-from .escrow_stub import EscrowStub
+from .escrow import EscrowVerifier
 from .messages import (
     Payload,
     Result,
@@ -166,7 +166,10 @@ class Provider:
     """Serves ``acmp/invoke`` requests for a set of registered capabilities.
 
     ``escrow`` is optional and only meaningful once negotiation is in use (see
-    Stage 2). ``output_streaming`` / ``input_streaming`` /
+    Stage 2) — typically an :class:`~acmp.escrow.EscrowClient` connected to
+    the Escrow Agent that bound this provider as payee (Layer 4). Any object
+    satisfying :class:`~acmp.escrow.EscrowVerifier` works.
+    ``output_streaming`` / ``input_streaming`` /
     ``heartbeat_interval_ms`` are the Layer 1 §1 feature advertisements: the
     in-memory SDK has no MCP ``initialize`` handshake, so the flags gate
     enforcement on the provider side (-33007 for non-advertised features).
@@ -179,7 +182,7 @@ class Provider:
         transport: Transport,
         provider_id: str,
         *,
-        escrow: EscrowStub | None = None,
+        escrow: EscrowVerifier | None = None,
         output_streaming: bool = False,
         input_streaming: bool = False,
         heartbeat_interval_ms: int | None = None,
@@ -354,7 +357,7 @@ class Provider:
             )
 
         if task.escrow_id is not None and self._escrow is not None:
-            if not self._escrow.covers(task.escrow_id, cap.price_cu):
+            if not await self._escrow.covers(task.escrow_id, cap.price_cu):
                 raise AcmpError(
                     ErrorCode.ESCROW_INVALID,
                     data={"task_id": task.task_id, "escrow_id": task.escrow_id},

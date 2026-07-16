@@ -1,5 +1,9 @@
 """Tests for Stage 2: Layer 6 negotiation (offer request -> offer -> accept)
 followed by a Layer 1 invoke using the negotiated escrow_id.
+
+The two tests that touch Layer 4 wire a real :class:`EscrowAgent` over its
+own connection rather than an in-process stub — the same "genuinely separate
+party" model used throughout Stage 5 (see tests/test_l4_escrow.py).
 """
 
 from __future__ import annotations
@@ -12,7 +16,8 @@ from acmp import (
     AcmpError,
     Buyer,
     ErrorCode,
-    EscrowStub,
+    EscrowAgent,
+    EscrowClient,
     InMemoryTransport,
     NegotiationErrorCode,
     Negotiator,
@@ -22,6 +27,9 @@ from acmp import (
     Task,
 )
 
+BUYER_ID = "agent:test-buyer:local"
+PROVIDER_ID = "agent:test-provider:local"
+
 
 async def echo_capability(task: Task) -> Payload:
     return Payload(type="json", data={"echo": task.input.data})
@@ -29,21 +37,26 @@ async def echo_capability(task: Task) -> Payload:
 
 def make_pair(price_cu: float = 0.003, latency_sla_ms: int | None = 800):
     buyer_t, provider_t = InMemoryTransport.create_pair()
-    escrow = EscrowStub()
-    provider = Provider(provider_t, provider_id="agent:test-provider:local", escrow=escrow)
+    provider = Provider(provider_t, provider_id=PROVIDER_ID)
     provider.register(
         "echo", echo_capability, price_cu=price_cu, tokens_per_call=10, latency_sla_ms=latency_sla_ms
     )
-    return buyer_t, provider_t, provider, escrow
+    return buyer_t, provider_t, provider
 
 
 @pytest.mark.asyncio
 async def test_full_negotiation_then_invoke():
-    buyer_t, provider_t, provider, escrow = make_pair(price_cu=0.003)
+    buyer_t, provider_t, provider = make_pair(price_cu=0.003)
     serve_task = asyncio.create_task(provider.serve_forever())
 
-    async with Buyer(buyer_t) as buyer:
+    escrow_agent = EscrowAgent()
+    escrow_agent.ledger.credit(BUYER_ID, 1.0)
+    escrow_client_t, escrow_agent_t = InMemoryTransport.create_pair()
+    escrow_serve_task = asyncio.create_task(escrow_agent.serve(escrow_agent_t, BUYER_ID))
+
+    async with Buyer(buyer_t) as buyer, Buyer(escrow_client_t) as escrow_conn:
         negotiator = Negotiator(buyer)
+        escrow = EscrowClient(escrow_conn)
 
         offer = await negotiator.request_offer(
             OfferRequest(
@@ -59,10 +72,12 @@ async def test_full_negotiation_then_invoke():
         assert not offer.is_expired()
 
         # Layer 6 §2.2: the buyer locks (Layer 4) and supplies the escrow_id.
-        escrow_id = escrow.lock(offer.price_cu)
-        accepted = await negotiator.accept(offer, escrow_id=escrow_id)
+        locked = await escrow.lock(
+            offer.price_cu, valid_until_ms=int(offer.valid_until_ms) + 3_600_000
+        )
+        accepted = await negotiator.accept(offer, escrow_id=locked.escrow_id)
         assert accepted.price_cu == 0.003
-        assert accepted.escrow_id == escrow_id
+        assert accepted.escrow_id == locked.escrow_id
 
         task = Task(
             capability="echo",
@@ -78,11 +93,12 @@ async def test_full_negotiation_then_invoke():
     assert result.proof["method"] == "result-hash"
 
     await serve_task
+    await escrow_serve_task
 
 
 @pytest.mark.asyncio
 async def test_offer_request_exceeding_budget_raises():
-    buyer_t, provider_t, provider, _escrow = make_pair(price_cu=0.01)
+    buyer_t, provider_t, provider = make_pair(price_cu=0.01)
     serve_task = asyncio.create_task(provider.serve_forever())
 
     async with Buyer(buyer_t) as buyer:
@@ -99,7 +115,7 @@ async def test_offer_request_exceeding_budget_raises():
 
 @pytest.mark.asyncio
 async def test_offer_request_unknown_capability_raises():
-    buyer_t, provider_t, provider, _escrow = make_pair()
+    buyer_t, provider_t, provider = make_pair()
     serve_task = asyncio.create_task(provider.serve_forever())
 
     async with Buyer(buyer_t) as buyer:
@@ -114,7 +130,7 @@ async def test_offer_request_unknown_capability_raises():
 
 @pytest.mark.asyncio
 async def test_accept_unknown_offer_id_raises():
-    buyer_t, provider_t, provider, _escrow = make_pair()
+    buyer_t, provider_t, provider = make_pair()
     serve_task = asyncio.create_task(provider.serve_forever())
 
     async with Buyer(buyer_t) as buyer:
@@ -129,7 +145,7 @@ async def test_accept_unknown_offer_id_raises():
 @pytest.mark.asyncio
 async def test_offer_request_with_unsupported_proof_raises():
     """Layer 6 §2.1: quoting an undeliverable proof method MUST fail (-33006)."""
-    buyer_t, provider_t, provider, _escrow = make_pair()
+    buyer_t, provider_t, provider = make_pair()
     serve_task = asyncio.create_task(provider.serve_forever())
 
     async with Buyer(buyer_t) as buyer:
@@ -146,7 +162,7 @@ async def test_offer_request_with_unsupported_proof_raises():
 
 @pytest.mark.asyncio
 async def test_accept_without_escrow_is_direct_mode():
-    buyer_t, provider_t, provider, _escrow = make_pair()
+    buyer_t, provider_t, provider = make_pair()
     serve_task = asyncio.create_task(provider.serve_forever())
 
     async with Buyer(buyer_t) as buyer:
@@ -161,7 +177,7 @@ async def test_accept_without_escrow_is_direct_mode():
 
 @pytest.mark.asyncio
 async def test_double_accept_raises_already_accepted():
-    buyer_t, provider_t, provider, _escrow = make_pair()
+    buyer_t, provider_t, provider = make_pair()
     serve_task = asyncio.create_task(provider.serve_forever())
 
     async with Buyer(buyer_t) as buyer:
@@ -179,7 +195,7 @@ async def test_double_accept_raises_already_accepted():
 
 @pytest.mark.asyncio
 async def test_accept_after_expiry_raises_offer_expired():
-    buyer_t, provider_t, provider, _escrow = make_pair()
+    buyer_t, provider_t, provider = make_pair()
     serve_task = asyncio.create_task(provider.serve_forever())
 
     async with Buyer(buyer_t) as buyer:
@@ -199,18 +215,31 @@ async def test_accept_after_expiry_raises_offer_expired():
 
 @pytest.mark.asyncio
 async def test_invoke_with_invalid_escrow_id_raises():
-    buyer_t, provider_t, provider, _escrow = make_pair(price_cu=0.003)
-    serve_task = asyncio.create_task(provider.serve_forever())
+    """Layer 1 §3.3 -33005: an escrow_id the provider's Escrow Agent doesn't
+    recognize must fail the invoke — checked over a real Layer 4 connection
+    rather than an in-process stub."""
+    buyer_t, provider_t = InMemoryTransport.create_pair()
+    escrow_agent = EscrowAgent()
+    escrow_client_t, escrow_agent_t = InMemoryTransport.create_pair()
+    escrow_serve_task = asyncio.create_task(escrow_agent.serve(escrow_agent_t, PROVIDER_ID))
 
-    async with Buyer(buyer_t) as buyer:
-        task = Task(
-            capability="echo",
-            input=Payload(type="text", data="x"),
-            escrow_id="esc_never_locked",
+    async with Buyer(escrow_client_t) as escrow_conn:
+        provider = Provider(
+            provider_t, provider_id=PROVIDER_ID, escrow=EscrowClient(escrow_conn)
         )
-        with pytest.raises(AcmpError) as exc_info:
-            await buyer.invoke(task)
+        provider.register("echo", echo_capability, price_cu=0.003, tokens_per_call=10)
+        serve_task = asyncio.create_task(provider.serve_forever())
 
-    assert exc_info.value.code == ErrorCode.ESCROW_INVALID
+        async with Buyer(buyer_t) as buyer:
+            task = Task(
+                capability="echo",
+                input=Payload(type="text", data="x"),
+                escrow_id="esc_never_locked",
+            )
+            with pytest.raises(AcmpError) as exc_info:
+                await buyer.invoke(task)
 
-    await serve_task
+        assert exc_info.value.code == ErrorCode.ESCROW_INVALID
+        await serve_task
+
+    await escrow_serve_task

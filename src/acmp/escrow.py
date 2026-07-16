@@ -116,7 +116,12 @@ class Escrow:
     expired: bool = False
     """Closed by expiry auto-reclaim: further mutations answer -35004."""
     op_results: dict[str, dict[str, Any]] = field(default_factory=dict)
-    """op_ref -> first outcome (result or error), replayed on retry (§3)."""
+    """op_ref -> first outcome (result or error), replayed on retry (§3).
+
+    Grows without eviction for this escrow's lifetime — acceptable for a
+    reference implementation and for any one escrow's naturally bounded
+    handful of operations, but a long-lived production agent would want a
+    TTL or an eviction policy here."""
 
     @property
     def remaining_cu(self) -> float:
@@ -135,6 +140,10 @@ class CreditLedger:
     def __init__(self) -> None:
         self._balances: dict[str, float] = {}
         self._paid: set[tuple[str, str]] = set()
+        """(escrow_id, transition) pairs ever paid out. Grows without
+        eviction for the ledger's lifetime — see the note on
+        :attr:`Escrow.op_results`; the same reference-implementation
+        trade-off applies here."""
 
     def balance(self, account_id: str) -> float:
         return self._balances.get(account_id, 0.0)
@@ -196,12 +205,18 @@ class EscrowAgent:
         self._now_ms = now_ms
         self._default_challenge_window_ms = default_challenge_window_ms
         self._escrows: dict[str, Escrow] = {}
+        """escrow_id -> Escrow, retained even once ``closed`` — like
+        ``_lock_ops`` below, this grows without eviction for the agent's
+        lifetime. Fine for a reference implementation and for demos/tests;
+        a long-lived production agent would want to archive or evict closed
+        escrows past some retention window."""
         self._lock_ops: dict[str, dict[str, Any]] = {}
         """op_ref -> cached escrowLock outcome, keyed agent-wide rather than
         per-escrow: a lock retry has no escrow_id to key off yet, so without
         this a retried escrowLock would open a second escrow and double-debit
         the buyer (§3 applies to escrowLock too, even though its wording
-        talks about "the same escrow")."""
+        talks about "the same escrow"). Grows without eviction, same
+        trade-off as ``_escrows``."""
 
     @property
     def ledger(self) -> CreditLedger:
@@ -257,7 +272,15 @@ class EscrowAgent:
                 )
             return
 
-        req_id = message["id"]
+        req_id = message.get("id")
+        if req_id is None:
+            # A well-formed request always carries an id; a peer that omits
+            # one (malformed, or a notification-style send) gets no reply —
+            # there's nothing to correlate a response to. Over a real network
+            # transport (unlike the in-memory demos) a peer can genuinely
+            # send this, so it must be dropped here rather than raising
+            # KeyError and killing the whole connection's serve() loop.
+            return
         try:
             result = handler(party_id, message.get("params", {}))
         except AcmpError as err:

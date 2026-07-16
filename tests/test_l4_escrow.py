@@ -1106,3 +1106,37 @@ def test_ledger_debit_of_never_credited_account_raises_cleanly():
         ledger.debit("agent:never-funded:test", 0.005)
 
     assert exc_info.value.code == EscrowErrorCode.INSUFFICIENT_FUNDS
+
+
+# --- malformed request without an id (survives instead of killing serve()) ----
+
+
+@pytest.mark.asyncio
+async def test_request_without_id_is_dropped_and_connection_survives():
+    """A request-shaped message missing "id" (malformed, or a client that
+    incorrectly sent a notification) must not crash serve() — only the
+    Buyer helper always sets an id, so this sends raw over the transport."""
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    client_t, agent_t = InMemoryTransport.create_pair()
+    serve_task = asyncio.create_task(agent.serve(agent_t, BUYER_ID))
+
+    # A request-shaped message with no "id" — not valid JSON-RPC, yet
+    # exactly the kind of malformed input a real network peer (over
+    # acmp.ws_transport) could send. Sent raw: Buyer.request() always sets
+    # an id, so it can't produce this case itself.
+    await client_t.send(
+        {
+            "jsonrpc": "2.0",
+            "method": "acmp/escrowLock",
+            "params": {"op_ref": "op_x", "amount_cu": 0.005, "valid_until_ms": FAR_FUTURE_MS},
+        }
+    )
+
+    # The connection must still be alive for a subsequent, well-formed
+    # request — proof serve() didn't crash/exit on the malformed one.
+    async with Buyer(client_t) as buyer:
+        locked = await EscrowClient(buyer).lock(0.005, valid_until_ms=FAR_FUTURE_MS)
+        assert locked.state == "open"
+
+    await serve_task

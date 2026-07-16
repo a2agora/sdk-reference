@@ -39,6 +39,22 @@ def new_op_ref() -> str:
     return f"op_{secrets.token_hex(6)}"
 
 
+def _require_positive_amount(amount_cu: float) -> None:
+    """Reject a non-positive ``amount_cu``.
+
+    Every ``balance < amount_cu`` / ``amount_cu > remaining_cu`` guard in
+    this module is trivially satisfied by a negative number, which would
+    otherwise let a caller manufacture CU: a negative lock credits the
+    ledger instead of debiting it, and a negative release/reclaim inflates
+    ``remaining_cu`` beyond what was ever funded.
+    """
+    if amount_cu <= 0:
+        raise AcmpError(
+            EscrowErrorCode.INVALID_STATE,
+            data={"amount_cu": amount_cu, "detail": "amount_cu must be positive"},
+        )
+
+
 DEFAULT_CHALLENGE_WINDOW_MS = 86_400_000
 """Agent-policy default challenge window: 24 h (Layer 4 §4.1 RECOMMENDED)."""
 
@@ -133,7 +149,7 @@ class CreditLedger:
                 EscrowErrorCode.INSUFFICIENT_FUNDS,
                 data={"account_id": account_id, "amount_cu": amount_cu},
             )
-        self._balances[account_id] -= amount_cu
+        self._balances[account_id] = self.balance(account_id) - amount_cu
 
     def payout(
         self, escrow_id: str, transition: str, account_id: str, amount_cu: float
@@ -361,6 +377,7 @@ class EscrowAgent:
 
     def _do_lock(self, party_id: str, params: dict[str, Any]) -> dict[str, Any]:
         amount_cu = params["amount_cu"]
+        _require_positive_amount(amount_cu)
         valid_until_ms = params["valid_until_ms"]
         challenge_window_ms = params.get("challenge_window_ms")
         if challenge_window_ms is None:
@@ -429,6 +446,7 @@ class EscrowAgent:
                 )
 
             amount_cu = params["amount_cu"]
+            _require_positive_amount(amount_cu)
             payee_id = params["payee_id"]
             resolves_claim = esc.state is EscrowState.CLAIMED
 
@@ -506,10 +524,12 @@ class EscrowAgent:
             amount_cu = params.get("amount_cu")
             if amount_cu is None:
                 amount_cu = esc.remaining_cu
-            elif amount_cu > esc.remaining_cu:
-                raise AcmpError(
-                    EscrowErrorCode.AMOUNT_EXCEEDS_REMAINING, data={"escrow_id": escrow_id}
-                )
+            else:
+                _require_positive_amount(amount_cu)
+                if amount_cu > esc.remaining_cu:
+                    raise AcmpError(
+                        EscrowErrorCode.AMOUNT_EXCEEDS_REMAINING, data={"escrow_id": escrow_id}
+                    )
 
             esc.reclaimed_cu += amount_cu
             esc.state = EscrowState.CLOSED if esc.remaining_cu <= 0 else EscrowState.OPEN
@@ -546,6 +566,7 @@ class EscrowAgent:
                 )
 
             amount_cu = params["amount_cu"]
+            _require_positive_amount(amount_cu)
             if amount_cu > esc.remaining_cu:
                 raise AcmpError(
                     EscrowErrorCode.AMOUNT_EXCEEDS_REMAINING, data={"escrow_id": escrow_id}

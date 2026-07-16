@@ -964,3 +964,145 @@ async def test_dispute_suspends_auto_release_even_past_window():
     assert status.state == "disputed"  # not auto-released
     assert agent.ledger.balance(PAYEE_ID) == 0
     await asyncio.gather(*serve_tasks)
+
+
+# --- non-positive amount_cu rejection (fund-creation regression) ---------------
+# A negative amount_cu flips every "balance < amount_cu" / "amount_cu >
+# remaining_cu" guard to be trivially satisfied — without this rejection, a
+# buyer with any positive balance could manufacture unlimited CU via a
+# negative lock, or inflate remaining_cu without limit via a negative
+# release/reclaim. Found during code review of the merged feature.
+
+
+@pytest.mark.asyncio
+async def test_lock_with_negative_amount_raises_invalid_state():
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn,), serve_tasks = await _wire(agent, BUYER_ID)
+
+    async with buyer_conn:
+        with pytest.raises(AcmpError) as exc_info:
+            await EscrowClient(buyer_conn).lock(-1000.0, valid_until_ms=FAR_FUTURE_MS)
+
+    assert exc_info.value.code == EscrowErrorCode.INVALID_STATE
+    assert agent.ledger.balance(BUYER_ID) == 1.0  # untouched
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_lock_with_zero_amount_raises_invalid_state():
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn,), serve_tasks = await _wire(agent, BUYER_ID)
+
+    async with buyer_conn:
+        with pytest.raises(AcmpError) as exc_info:
+            await EscrowClient(buyer_conn).lock(0.0, valid_until_ms=FAR_FUTURE_MS)
+
+    assert exc_info.value.code == EscrowErrorCode.INVALID_STATE
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_release_with_negative_amount_raises_invalid_state():
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn,), serve_tasks = await _wire(agent, BUYER_ID)
+
+    async with buyer_conn:
+        escrow = EscrowClient(buyer_conn)
+        locked = await escrow.lock(0.5, valid_until_ms=FAR_FUTURE_MS)
+
+        with pytest.raises(AcmpError) as exc_info:
+            await escrow.release(locked.escrow_id, -1_000_000.0, "agent:throwaway:nobody")
+
+    assert exc_info.value.code == EscrowErrorCode.INVALID_STATE
+    assert agent.escrow(locked.escrow_id).remaining_cu == pytest.approx(0.5)  # unchanged
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_reclaim_with_negative_amount_raises_invalid_state():
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn,), serve_tasks = await _wire(agent, BUYER_ID)
+
+    async with buyer_conn:
+        escrow = EscrowClient(buyer_conn)
+        locked = await escrow.lock(0.5, valid_until_ms=FAR_FUTURE_MS)
+
+        with pytest.raises(AcmpError) as exc_info:
+            await escrow.reclaim(locked.escrow_id, amount_cu=-5.0)
+
+    assert exc_info.value.code == EscrowErrorCode.INVALID_STATE
+    assert agent.escrow(locked.escrow_id).remaining_cu == pytest.approx(0.5)  # unchanged
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_reclaim_with_explicit_zero_amount_raises_invalid_state():
+    """Unlike omitting amount_cu (which defaults to the full remaining
+    balance), an explicit amount_cu=0 is a caller-supplied non-positive
+    amount and must be rejected the same as a negative one."""
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn,), serve_tasks = await _wire(agent, BUYER_ID)
+
+    async with buyer_conn:
+        escrow = EscrowClient(buyer_conn)
+        locked = await escrow.lock(0.5, valid_until_ms=FAR_FUTURE_MS)
+
+        with pytest.raises(AcmpError) as exc_info:
+            await escrow.reclaim(locked.escrow_id, amount_cu=0.0)
+
+    assert exc_info.value.code == EscrowErrorCode.INVALID_STATE
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_reclaim_without_amount_defaults_to_full_remaining():
+    """Omitting amount_cu (the normal happy-path call) must keep working —
+    only an explicit non-positive amount is rejected."""
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn,), serve_tasks = await _wire(agent, BUYER_ID)
+
+    async with buyer_conn:
+        escrow = EscrowClient(buyer_conn)
+        locked = await escrow.lock(0.5, valid_until_ms=FAR_FUTURE_MS)
+
+        reclaimed = await escrow.reclaim(locked.escrow_id)  # no amount_cu
+
+    assert reclaimed.reclaimed_cu == pytest.approx(0.5)
+    assert reclaimed.state == "closed"
+    await asyncio.gather(*serve_tasks)
+
+
+@pytest.mark.asyncio
+async def test_claim_with_negative_amount_raises_invalid_state():
+    agent = EscrowAgent()
+    agent.ledger.credit(BUYER_ID, 1.0)
+    (buyer_conn, payee_conn), serve_tasks = await _wire(agent, BUYER_ID, PAYEE_ID)
+
+    async with buyer_conn, payee_conn:
+        locked = await EscrowClient(buyer_conn).lock(
+            0.5, valid_until_ms=FAR_FUTURE_MS, payee_id=PAYEE_ID
+        )
+
+        with pytest.raises(AcmpError) as exc_info:
+            await EscrowClient(payee_conn).claim(
+                locked.escrow_id, -1.0, "task_1", {"method": "result-hash", "hash": "sha256:x"}
+            )
+
+    assert exc_info.value.code == EscrowErrorCode.INVALID_STATE
+    await asyncio.gather(*serve_tasks)
+
+
+def test_ledger_debit_of_never_credited_account_raises_cleanly():
+    """A debit larger than the (implicit zero) balance on a brand-new
+    account must raise -35002, not crash with KeyError."""
+    ledger = CreditLedger()
+    with pytest.raises(AcmpError) as exc_info:
+        ledger.debit("agent:never-funded:test", 0.005)
+
+    assert exc_info.value.code == EscrowErrorCode.INSUFFICIENT_FUNDS

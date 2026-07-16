@@ -13,7 +13,7 @@ from .dag import (
     Edge,
     InputRef,
 )
-from .errors import AcmpError, ErrorCode
+from .errors import AcmpError, ErrorCode, EscrowErrorCode
 from .escrow_stub import EscrowStub
 from .messages import ACMP_VERSION, Payload, Result, Task
 from .negotiation import (
@@ -38,6 +38,7 @@ __all__ = [
     "DagValidationError",
     "Edge",
     "ErrorCode",
+    "EscrowErrorCode",
     "EscrowStub",
     "InMemoryTransport",
     "InputRef",

@@ -1,7 +1,9 @@
 """ACMP error codes and exception type.
 
-Codes are defined in Layer 1 §3.3. They live in the -33xxx range to avoid
-collision with the JSON-RPC reserved range (-32xxx).
+Layer 1 §3.3 codes live in the -33xxx range to avoid collision with the
+JSON-RPC reserved range (-32xxx). Layer 4 §5 escrow codes use -35xxx
+(-34xxx is informally taken by negotiation, see
+:class:`acmp.negotiation.NegotiationErrorCode`).
 """
 
 from __future__ import annotations
@@ -23,8 +25,20 @@ class ErrorCode(IntEnum):
     INTERNAL = -33099
 
 
+class EscrowErrorCode(IntEnum):
+    """Layer 4 §5 escrow error codes (-35xxx), raised by an Escrow Agent."""
+
+    ESCROW_NOT_FOUND = -35001
+    INSUFFICIENT_FUNDS = -35002
+    INVALID_STATE = -35003
+    ESCROW_EXPIRED = -35004
+    NOT_AUTHORIZED = -35005
+    AMOUNT_EXCEEDS_REMAINING = -35006
+    INTERNAL = -35099
+
+
 # Default human-readable messages for each code.
-_DEFAULT_MESSAGES: dict[ErrorCode, str] = {
+_DEFAULT_MESSAGES: dict[IntEnum, str] = {
     ErrorCode.BUDGET_EXCEEDED: "Budget exceeded",
     ErrorCode.CAPABILITY_NOT_FOUND: "Capability not found",
     ErrorCode.TIMEOUT: "Task timed out",
@@ -33,6 +47,13 @@ _DEFAULT_MESSAGES: dict[ErrorCode, str] = {
     ErrorCode.PROOF_UNSUPPORTED: "Proof method unsupported",
     ErrorCode.FEATURE_UNSUPPORTED: "Feature unsupported",
     ErrorCode.INTERNAL: "Internal provider error",
+    EscrowErrorCode.ESCROW_NOT_FOUND: "Unknown escrow_id",
+    EscrowErrorCode.INSUFFICIENT_FUNDS: "Lock could not be funded",
+    EscrowErrorCode.INVALID_STATE: "Operation not permitted in the current state",
+    EscrowErrorCode.ESCROW_EXPIRED: "The lock passed valid_until_ms and was auto-reclaimed",
+    EscrowErrorCode.NOT_AUTHORIZED: "Caller is not the party allowed to perform this operation",
+    EscrowErrorCode.AMOUNT_EXCEEDS_REMAINING: "Amount exceeds the remaining balance",
+    EscrowErrorCode.INTERNAL: "Internal escrow-agent error",
 }
 
 
@@ -46,7 +67,7 @@ class AcmpError(Exception):
 
     def __init__(
         self,
-        code: "ErrorCode | int",
+        code: "IntEnum | int",
         message: str | None = None,
         data: dict[str, Any] | None = None,
     ) -> None:
@@ -63,13 +84,17 @@ class AcmpError(Exception):
     def from_jsonrpc(cls, err: dict[str, Any]) -> "AcmpError":
         """Reconstruct an :class:`AcmpError` from a JSON-RPC ``error`` object.
 
-        The code is kept as a plain ``int`` when it falls outside
-        :class:`ErrorCode` — e.g. a Layer 6 negotiation error, which isn't
-        part of the Layer 1 §3.3 table this enum models.
+        The code is resolved to :class:`ErrorCode` (Layer 1) or
+        :class:`EscrowErrorCode` (Layer 4) where possible, and kept as a
+        plain ``int`` otherwise — e.g. a Layer 6 negotiation error, whose
+        enum lives in :mod:`acmp.negotiation`.
         """
         raw_code = err["code"]
-        try:
-            code: "ErrorCode | int" = ErrorCode(raw_code)
-        except ValueError:
-            code = raw_code
+        code: "IntEnum | int" = raw_code
+        for enum_cls in (ErrorCode, EscrowErrorCode):
+            try:
+                code = enum_cls(raw_code)
+                break
+            except ValueError:
+                continue
         return cls(code, err.get("message"), err.get("data"))
